@@ -184,7 +184,26 @@ tensor_t Tensor::slice(size_t dim, size_t start, size_t end) const {
 }
 
 void Tensor::load(const void *src_) {
-    TO_BE_IMPLEMENTED();
+    // Set the device context for this tensor
+    core::context().setDevice(this->deviceType(), this->deviceId());
+    
+    // Calculate the total size to copy in bytes
+    size_t size_bytes = this->numel() * this->elementSize();
+    
+    // Determine the memory copy kind based on device type
+    llaisysMemcpyKind_t copy_kind;
+    if (this->deviceType() == LLAISYS_DEVICE_CPU) {
+        copy_kind = LLAISYS_MEMCPY_H2H;  // Host to Host
+    } else {
+        copy_kind = LLAISYS_MEMCPY_H2D;  // Host to Device
+    }
+    
+    // Perform the memory copy from source to tensor's data
+    core::context().runtime().api()->memcpy_sync(
+        this->data(),      // destination: tensor's data
+        src_,              // source: host data
+        size_bytes,        // size in bytes
+        copy_kind);        // copy direction
 }
 
 tensor_t Tensor::contiguous() const {
