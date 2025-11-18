@@ -88,3 +88,6 @@ htmlcov/
 Thumbs.db
 ehthumbs.db
 desktop.ini
+
+# CodeQL
+_codeql_detected_source_root
