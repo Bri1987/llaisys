@@ -64,6 +64,33 @@ def to_torch_tensor(x):
     elif dtype == DataType.BF16:
         td = torch.bfloat16
         np_dtype = _np.uint16
+    elif dtype == DataType.F64:
+        td = torch.float64
+        np_dtype = _np.float64
+    elif dtype == DataType.I8:
+        td = torch.int8
+        np_dtype = _np.int8
+    elif dtype == DataType.I16:
+        td = torch.int16
+        np_dtype = _np.int16
+    elif dtype == DataType.I32:
+        td = torch.int32
+        np_dtype = _np.int32
+    elif dtype == DataType.I64:
+        td = torch.int64
+        np_dtype = _np.int64
+    elif dtype == DataType.U8:
+        td = torch.uint8
+        np_dtype = _np.uint8
+    elif dtype == DataType.U16:
+        td = torch.uint16 if hasattr(torch, 'uint16') else torch.int32
+        np_dtype = _np.uint16
+    elif dtype == DataType.U32:
+        td = torch.uint32 if hasattr(torch, 'uint32') else torch.int64
+        np_dtype = _np.uint32
+    elif dtype == DataType.U64:
+        td = torch.uint64 if hasattr(torch, 'uint64') else torch.int64
+        np_dtype = _np.uint64
     else:
         raise TypeError(f"Unsupported dtype for Triton kernel: {dtype}")
 
@@ -198,6 +225,43 @@ def llaisysArgmax(max_idx_out, max_val_out, vals):
         pass
 
     return max_idx_out, max_val_out
+
+
+def llaisysEmbedding(out, index, weight):
+    """Launcher for Triton-backed embedding.
+
+    Converts LLAISYS handles to CUDA torch tensors, runs the Triton kernel,
+    and writes back the output.
+    """
+    # convert inputs to torch tensors if needed
+    index_t = to_torch_tensor(index) if not isinstance(index, torch.Tensor) else index
+    weight_t = to_torch_tensor(weight) if not isinstance(weight, torch.Tensor) else weight
+
+    # ensure index is int32 on device for Triton kernel
+    if index_t.dtype != torch.int32:
+        index_i32 = index_t.to(dtype=torch.int32)
+    else:
+        index_i32 = index_t
+
+    N = index_i32.numel()
+    D = weight_t.shape[1]
+
+    # allocate output on device with same dtype as weight
+    out_t = torch.empty((N, D), dtype=weight_t.dtype, device=weight_t.device)
+
+    # call Triton kernel
+    embedding_kernel.kernel(index_i32, weight_t, out_t, N, D, BLOCK_SIZE=1024)
+
+    # write back
+    try:
+        if not isinstance(out, torch.Tensor):
+            from_torch_to_ptr(out_t, out)
+        else:
+            out.copy_(out_t)
+    except Exception:
+        pass
+
+    return out
 
 # implement other operators below
 
