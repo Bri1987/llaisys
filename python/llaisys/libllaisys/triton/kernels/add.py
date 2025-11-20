@@ -37,7 +37,7 @@ def _make_add_kernel():
     def _kernel(a_ptr, b_ptr, c_ptr, n, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
         offset = pid * BLOCK
-        idxs = offset + tl.arange(0, BLOCK)
+        idxs = offset + tl.cast(tl.arange(0, BLOCK), tl.int32)
         mask = idxs < n
         a = tl.load(a_ptr + idxs, mask=mask)
         b = tl.load(b_ptr + idxs, mask=mask)
@@ -75,22 +75,14 @@ def kernel(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, BLOCK_SIZE: int = 
 
     global _CACHED_KERNEL
     if _CACHED_KERNEL is None:
-        try:
-            _CACHED_KERNEL = _make_add_kernel()
-        except Exception:
-            # fall back to torch implementation
-            torch.add(a, b, out=c)
-            return
+        _CACHED_KERNEL = _make_add_kernel()
 
     n = a.numel()
     grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
 
-    try:
-        # Launch Triton kernel with raw pointers
-        _CACHED_KERNEL[grid](a.data_ptr(), b.data_ptr(), c.data_ptr(), n, BLOCK=BLOCK_SIZE)
-    except Exception:
-        # on any Triton failure, fallback to torch
-        torch.add(a, b, out=c)
+    # Launch Triton kernel with raw pointers (let exceptions propagate on failure)
+    # Pass torch tensors directly to Triton JIT (it will handle device pointers)
+    _CACHED_KERNEL[grid](a, b, c, n, BLOCK=BLOCK_SIZE)
     # Debug: print the device result just after kernel/fallback to inspect
     try:
         if c.numel() <= 64:
