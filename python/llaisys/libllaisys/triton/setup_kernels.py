@@ -144,5 +144,60 @@ def llaisysAdd(out, a, b):
 
     return out
 
+
+def llaisysArgmax(max_idx_out, max_val_out, vals):
+    """Launcher for Triton argmax: convert inputs, run Triton kernels, write back."""
+    # convert vals to torch tensor on CUDA
+    vals_t = to_torch_tensor(vals) if not isinstance(vals, torch.Tensor) else vals
+
+    # remember original dtype so we can cast results back
+    orig_dtype = vals_t.dtype
+    # ensure we operate in float32 for comparison simplicity
+    if vals_t.dtype != torch.float32:
+        vals_f32 = vals_t.to(dtype=torch.float32)
+    else:
+        vals_f32 = vals_t
+
+    n = vals_f32.numel()
+    # choose BLOCK_SIZE (power of two, up to 1024)
+    BLOCK_SIZE = 1024 if n >= 1024 else 1 << (n - 1).bit_length()
+
+    # compute number of blocks
+    num_blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
+
+    # allocate partial buffers on device
+    partial_vals = torch.empty((num_blocks,), dtype=torch.float32, device=vals_f32.device)
+    partial_idx = torch.empty((num_blocks,), dtype=torch.int32, device=vals_f32.device)
+
+    # run stage1 to fill partials
+    argmax_kernel.kernel_stage1(vals_f32, partial_vals, partial_idx, n, BLOCK_SIZE=BLOCK_SIZE)
+
+    # run stage2 to reduce partials to single result
+    # allocate single-element outputs on device
+    max_val_t = torch.empty((1,), dtype=torch.float32, device=vals_f32.device)
+    max_idx_t = torch.empty((1,), dtype=torch.int32, device=vals_f32.device)
+    argmax_kernel.kernel_stage2(partial_vals, partial_idx, max_val_t, max_idx_t, num_blocks, BLOCK_SIZE=1024)
+
+    # write back to llaisys outputs
+    try:
+        # if outputs are llaisys handles, use from_torch_to_ptr
+        if not isinstance(max_val_out, torch.Tensor):
+            # cast max_val_t back to original dtype if needed
+            out_val = max_val_t.to(dtype=orig_dtype)
+            from_torch_to_ptr(out_val, max_val_out)
+        else:
+            max_val_out.copy_(max_val_t.to(dtype=orig_dtype))
+
+        if not isinstance(max_idx_out, torch.Tensor):
+            # convert to i64 before writing back to external handle
+            out_idx = max_idx_t.to(dtype=torch.int64)
+            from_torch_to_ptr(out_idx, max_idx_out)
+        else:
+            max_idx_out.copy_(max_idx_t.to(dtype=torch.int64))
+    except Exception:
+        pass
+
+    return max_idx_out, max_val_out
+
 # implement other operators below
 
