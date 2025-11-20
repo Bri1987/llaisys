@@ -263,5 +263,48 @@ def llaisysEmbedding(out, index, weight):
 
     return out
 
+
+def llaisysLinear(out, inp, weight, bias):
+    """Launcher for Triton-backed linear: Y = X W^T + b
+
+    Converts inputs to torch tensors, launches Triton matmul kernel, writes back.
+    """
+    x_t = to_torch_tensor(inp) if not isinstance(inp, torch.Tensor) else inp
+    w_t = to_torch_tensor(weight) if not isinstance(weight, torch.Tensor) else weight
+
+    b_t = None
+    if bias is not None:
+        b_t = to_torch_tensor(bias) if not isinstance(bias, torch.Tensor) else bias
+
+    M, K = x_t.shape
+    N = w_t.shape[0]
+
+    # allocate output
+    out_t = torch.empty((M, N), dtype=w_t.dtype, device=w_t.device)
+
+    # call Triton kernel
+    # kernel expects flattened contiguous arrays; ensure contiguity
+    x_flat = x_t.contiguous()
+    w_flat = w_t.contiguous()
+    out_flat = out_t.contiguous()
+    if b_t is not None:
+        b_flat = b_t.contiguous()
+    else:
+        # pass an empty 1-D tensor (Triton will load zeros via mask)
+        b_flat = torch.zeros((N,), dtype=torch.float32, device=x_t.device)
+
+    linear_kernel._kernel[( (M + 64 - 1) // 64, (N + 64 - 1) // 64 )](x_flat, w_flat, out_flat, b_flat, M, N, K, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32)
+
+    # write back
+    try:
+        if not isinstance(out, torch.Tensor):
+            from_torch_to_ptr(out_t, out)
+        else:
+            out.copy_(out_t)
+    except Exception:
+        pass
+
+    return out
+
 # implement other operators below
 
