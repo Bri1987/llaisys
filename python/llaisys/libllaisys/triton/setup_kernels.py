@@ -420,3 +420,73 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float):
 
 # implement other operators below
 
+
+def llaisysSwiGLU(out, gate, up):
+    """Launcher for Triton-backed SwiGLU: out = up * gate / (1 + exp(-gate))
+
+    Accepts LLAISYS tensor handles or torch.Tensors. Kernel uses float32
+    for numerical stability and casts back to output dtype.
+    """
+    gate_t = to_torch_tensor(gate) if not isinstance(gate, torch.Tensor) else gate
+    up_t = to_torch_tensor(up) if not isinstance(up, torch.Tensor) else up
+
+    # validate shapes and dtypes
+    assert gate_t.shape == up_t.shape, "SwiGLU: gate and up must have same shape"
+
+    out_t = torch.empty_like(gate_t)
+
+    gate_flat = gate_t.contiguous().view(-1)
+    up_flat = up_t.contiguous().view(-1)
+    out_flat = out_t.contiguous().view(-1)
+
+    # call Triton kernel
+    swiglu_kernel.kernel(gate_flat, up_flat, out_flat, BLOCK=1024)
+
+    # write back
+    from_torch_to_ptr(out_t, out)
+
+    return out
+
+
+def llaisysROPE(out, inp, pos_ids, theta: float):
+    """Launcher for RoPE (rotation positional embeddings).
+
+    Computes in-place: out = rope(inp, pos_ids, theta)
+    This launcher uses PyTorch on the device for simplicity and correctness.
+    """
+    # Convert inputs to torch tensors on device
+    x_t = to_torch_tensor(inp) if not isinstance(inp, torch.Tensor) else inp
+    pos_t = to_torch_tensor(pos_ids) if not isinstance(pos_ids, torch.Tensor) else pos_ids
+
+    # validate shapes
+    assert x_t.dim() == 3
+    seq_len, n_heads, head_dim = x_t.shape
+    assert head_dim % 2 == 0
+
+    # allocate output
+    out_t = torch.empty_like(x_t)
+
+    # coerce theta to float
+    try:
+        if hasattr(theta, "value"):
+            theta_val = float(theta.value)
+        else:
+            theta_val = float(theta)
+    except Exception:
+        theta_val = float(theta)
+
+    # prepare position ids and freqs on device as float32
+    pos_f32 = pos_t.to(dtype=torch.float32, device=x_t.device).contiguous()
+    half = head_dim // 2
+    i = torch.arange(0, half, dtype=torch.float32, device=x_t.device)
+    # freq multiplier = 1 / (theta ** (2*i/head_dim))
+    freqs = (theta_val ** (2.0 * i / float(head_dim))).reciprocal()
+
+    # call Triton RoPE kernel: kernel expects x/out as (seq_len, n_heads, head_dim) tensors
+    rope_kernel.kernel(x_t.contiguous(), out_t.contiguous(), pos_f32, freqs, BLOCK=128)
+
+    # write back to LLAISYS output
+    from_torch_to_ptr(out_t, out)
+
+    return out
+

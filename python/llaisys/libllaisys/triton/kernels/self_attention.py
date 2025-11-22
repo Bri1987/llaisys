@@ -123,4 +123,5 @@ def kernel(
         v_block_ptr = tl.advance(v_block_ptr, (BLOCK_SIZE_N, 0))
 
     acc = acc / l_i[:, None]
-    tl.store(o_block_ptr, acc.to(o_ptr.type.element_ty), boundary_check=(0, 1))
+    # store result (let Triton handle dtype casting)
+    tl.store(o_block_ptr, acc, boundary_check=(0, 1))
