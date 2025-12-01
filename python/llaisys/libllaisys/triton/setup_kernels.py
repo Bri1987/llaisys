@@ -100,28 +100,26 @@ def to_torch_tensor(x):
     elem_size = _np.dtype(np_dtype).itemsize
     size_bytes = numel * elem_size
 
-    host_ptr = runtime.malloc_host(size_bytes)
+    # Perform a device-to-device copy only. If D2D is not available or
+    # fails, raise an error so tests can detect the absence of a D2D path.
+    src_ptr = _data_ptr(ptr)
+    if device_id is None or device_id < 0:
+        raise RuntimeError("Invalid device id for LLAISYS tensor; cannot perform D2D copy")
+
+    th = torch.empty(tuple(shape), device=f"cuda:{device_id}", dtype=td)
     try:
-        runtime.memcpy_sync(host_ptr, ctypes.c_void_p(_data_ptr(ptr)), size_bytes, MemcpyKind.D2H)
-        raw = ctypes.string_at(host_ptr, size_bytes)
-        if dtype == DataType.BF16:
-            arr_u16 = _np.frombuffer(raw, dtype=_np.uint16).copy()
-            arr_u16 = arr_u16.reshape(tuple(shape))
-            arr_u32 = (arr_u16.astype(_np.uint32) << 16)
-            arr_f32 = arr_u32.view(_np.float32)
-            th = torch.from_numpy(arr_f32).to(device=f"cuda:{device_id}", dtype=td)
-        else:
-            arr = _np.frombuffer(raw, dtype=np_dtype).copy()
-            arr = arr.reshape(tuple(shape))
-            th = torch.from_numpy(arr).to(device=f"cuda:{device_id}", dtype=td)
-        try:
-            if th.numel() <= 64:
-                print("[triton.setup] converted tensor (device):", th)
-        except Exception:
-            pass
-        return th
-    finally:
-        runtime.free_host(host_ptr)
+        runtime.memcpy_sync(ctypes.c_void_p(th.data_ptr()), ctypes.c_void_p(src_ptr), size_bytes, MemcpyKind.D2D)
+    except Exception as e:
+        # Surface a clear error: no fallback here by design for testing
+        raise RuntimeError(f"D2D memcpy failed: {e}") from e
+
+    try:
+        if th.numel() <= 64:
+            print("[triton.setup] converted tensor (device, D2D):", th)
+    except Exception:
+        pass
+
+    return th
 
 
 def from_torch_to_ptr(th, out):
