@@ -1,93 +1,59 @@
-"""Triton-backed `add` kernel for CUDA.
-
-This module provides a `kernel(a, b, c, BLOCK_SIZE=1024)` function that
-performs elementwise addition `c = a + b` on CUDA device using Triton. It
-accepts PyTorch tensors (`torch.Tensor`) on CUDA with dtype `float32` or
-`float16`.
-
-Usage example:
-    import torch
-    from llaisys.libllaisys.ninetoothed.kernels.add import kernel
-
-    a = torch.randn(10240, device='cuda', dtype=torch.float32)
-    b = torch.randn_like(a)
-    c = torch.empty_like(a)
-    kernel(a, b, c, BLOCK_SIZE=1024)
-
-Notes:
-- Triton must be installed (`pip install triton`) and PyTorch CUDA build
-  available.
-- The caller must ensure inputs/outputs are on the same CUDA device and
-  have identical shapes/dtypes.
-"""
+# file: triton/kernels/add.py
 
 try:
     import triton
     import triton.language as tl
-except Exception:
+except ImportError:
     triton = None
 
+# JIT 内核 (_kernel)
+# 它现在接收的是 Tensor-like 对象，而不是整数指针
+@triton.jit
+def _kernel(
+    A_tensor, 
+    B_tensor, 
+    C_tensor,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    
+    mask = offsets < n_elements
 
-def _make_add_kernel():
-    if triton is None:
-        raise RuntimeError("Triton not available")
-
-    @triton.jit
-    def _kernel(a_ptr, b_ptr, c_ptr, n, BLOCK: tl.constexpr):
-        pid = tl.program_id(0)
-        offset = pid * BLOCK
-        idxs = offset + tl.cast(tl.arange(0, BLOCK), tl.int32)
-        mask = idxs < n
-        a = tl.load(a_ptr + idxs, mask=mask)
-        b = tl.load(b_ptr + idxs, mask=mask)
-        tl.store(c_ptr + idxs, a + b, mask=mask)
-
-    return _kernel
+    # Triton 会自动从 A_tensor 中获取指针
+    # 我们仍然需要手动加上偏移量
+    a = tl.load(A_tensor + offsets, mask=mask)
+    b = tl.load(B_tensor + offsets, mask=mask)
+    
+    output = a + b
+    
+    tl.store(C_tensor + offsets, output, mask=mask)
 
 
-_CACHED_KERNEL = None
-
-
-def kernel(a , b , c , BLOCK_SIZE: int = 1024):
-    """Run elementwise add using Triton on CUDA tensors.
+# Python 侧的启动器 (kernel)
+def kernel(a, b, c, BLOCK_SIZE: int = 1024):
+    """
+    [最终版] Run elementwise add using Triton on wrapper objects.
 
     Args:
-        a, b, c: `torch.Tensor` on CUDA. Same shape and dtype (float32/float16).
-        BLOCK_SIZE: Triton block size (elements per program instance).
+        a, b, c: Objects that mimic a tensor interface for Triton,
+                 like TritonTensorWrapper or torch.Tensor.
     """
-    # This kernel expects `a`, `b`, `c` to be CUDA torch.Tensors.
-    # Conversions from LLAISYS handles are performed by the launcher
-    # (`triton.setup_kernels.llaisysAdd`).
-
-    # now a,b,c are torch tensors on CUDA
     if triton is None:
-        raise RuntimeError("Triton not found. Install triton (pip install triton).")
+        raise RuntimeError("Triton not found.")
 
-    if not (a.is_cuda and b.is_cuda and c.is_cuda):
-        raise ValueError("All tensors must be CUDA tensors")
-    if not (a.shape == b.shape == c.shape):
-        raise ValueError("All tensors must have the same shape")
-    if not (a.dtype == b.dtype == c.dtype):
-        raise ValueError("All tensors must have the same dtype")
-    # if a.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-    #     raise TypeError("Unsupported dtype: only float32/float16/bfloat16 are supported")
+    n_elements = a.numel()
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
 
-    global _CACHED_KERNEL
-    if _CACHED_KERNEL is None:
-        _CACHED_KERNEL = _make_add_kernel()
-
-    n = a.numel()
-    grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
-
-    # Launch Triton kernel with raw pointers (let exceptions propagate on failure)
-    # Pass torch tensors directly to Triton JIT (it will handle device pointers)
-    _CACHED_KERNEL[grid](a, b, c, n, BLOCK=BLOCK_SIZE)
-    # Debug: print the device result just after kernel/fallback to inspect
-    try:
-        if c.numel() <= 64:
-            print("[triton.add] device result (post-kernel):", c)
-    except Exception:
-        pass
-
-    # Launcher is responsible for any LLAISYS->Torch conversion and write-back.
-
+    # 【核心】直接将 wrapper 对象传递给 JIT 内核
+    _kernel[grid](
+        a,  # a 是 TritonTensorWrapper 对象
+        b,  # b 是 TritonTensorWrapper 对象
+        c,  # c 是 TritonTensorWrapper 对象
+        n_elements, 
+        BLOCK_SIZE=BLOCK_SIZE,
+    )

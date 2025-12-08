@@ -21,6 +21,92 @@ from .kernels import scaled_dot_product_attention_decode as decode_kernels
 import triton
 import triton.language as tl
 
+def ptr_to_int(ptr):
+    """Converts a ctypes pointer to an integer memory address."""
+    return ctypes.cast(ptr, ctypes.c_void_p).value
+
+def get_element_size(llaisys_dtype):
+    """Returns the size of a llaisys.DataType element in bytes."""
+    # 您需要根据您的 DataType 枚举来完善这个映射
+    dtype_map = {
+        DataType.F32: 4,
+        DataType.F16: 2,
+        DataType.BF16: 2,
+        DataType.I64: 8,
+        DataType.I32: 4,
+        # ... 其他类型 ...
+    }
+    return dtype_map.get(llaisys_dtype, 4) # 默认为 4 字节 (float32)
+
+class TritonTensorWrapper:
+    """
+    Wrapper to make llaisys.Tensor compatible with Triton's JIT.
+    Triton needs objects with a data_ptr() method and a .dtype attribute.
+    This wrapper provides those by querying the underlying llaisys.Tensor.
+    """
+    def __init__(self, llaisys_tensor):
+        self._tensor = llaisys_tensor
+        # 直接存储 C++ 句柄，避免过多的 Python 对象开销
+        self._handle = _get_raw_ptr(llaisys_tensor)
+
+        # 预先缓存属性，避免重复调用 C++ API
+        self._ptr = ptr_to_int(LIB_LLAISYS.tensorGetData(self._handle))
+        self._dtype_ll = DataType(LIB_LLAISYS.tensorGetDataType(self._handle))
+        
+        ndim = int(LIB_LLAISYS.tensorGetNdim(self._handle))
+        shape_buf = (ctypes.c_size_t * ndim)()
+        strides_buf = (ctypes.c_long * ndim)()
+        LIB_LLAISYS.tensorGetShape(self._handle, shape_buf)
+        LIB_LLAISYS.tensorGetStrides(self._handle, strides_buf)
+        
+        self._shape = tuple(shape_buf[i] for i in range(ndim))
+        self._strides = tuple(strides_buf[i] for i in range(ndim))
+
+    def data_ptr(self) -> int:
+        """Return raw pointer as an integer."""
+        return self._ptr
+
+    @property
+    def dtype(self):
+        """Return a dtype object compatible with Triton."""
+        # Triton 内部使用 torch.dtype, 所以我们这里需要一个映射
+        # 这是一个 "lazy import"，只在需要时才导入 torch
+        try:
+            import torch
+            dtype_map = {
+                DataType.F32: torch.float32,
+                DataType.F16: torch.float16,
+                DataType.BF16: torch.bfloat16,
+                DataType.I32: torch.int32,
+                DataType.I64: torch.int64,
+            }
+            return dtype_map.get(self._dtype_ll, torch.float32)
+        except ImportError:
+            # 如果没有 torch，Triton 最终可能还是会失败，但这让代码在逻辑上解耦
+            return None
+
+    @property
+    def shape(self):
+        return self._shape
+
+    @property
+    def strides(self):
+        return self._strides
+    
+    def numel(self) -> int:
+        """Return total number of elements."""
+        if not self._shape:
+            return 0
+        n = 1
+        for s in self._shape:
+            n *= s
+        return n
+
+    def element_size(self) -> int:
+        """Return element size in bytes."""
+        return get_element_size(self._dtype_ll)
+
+
 def get_optimal_s(batch_size: int, num_heads: int, seq_len: int, device: str = 'cuda') -> int:
     # 对于短序列，split/combine的开销占主导，强制S=1
     SEQ_LEN_THRESHOLD = 512 
@@ -219,28 +305,18 @@ def from_torch_to_ptr(th, out):
     view.load(ctypes.c_void_p(cpu.data_ptr()))
     
     
-# add examples:
 def llaisysAdd(out, a, b):
-    """Launcher that bridges LLAISYS tensors to Triton kernel.
-    
-    ## You need to convert input llaisys tensor into torch
-
-    Note: `Ops.add` calls this as `llaisysAdd(out, a, b)`, so we accept
-    `(out, a, b)` and invoke the Triton kernel as `kernel(a, b, out)`.
     """
-    # print("Using Triton add kernel")
-    # Convert inputs to torch tensors (if they are LLAISYS handles)
-    a_t = to_torch_tensor(a) if not isinstance(a, torch.Tensor) else a
-    b_t = to_torch_tensor(b) if not isinstance(b, torch.Tensor) else b
+    [无 Torch 版] Launcher that bridges LLAISYS tensors to the Triton add kernel.
+    """
+    # 1. 将 llaisys.Tensor 包装成 Triton 兼容的对象
+    a_wrapped = TritonTensorWrapper(a)
+    b_wrapped = TritonTensorWrapper(b)
+    out_wrapped = TritonTensorWrapper(out)
 
-    # allocate output torch tensor on same device/dtype as inputs
-    c_t = torch.empty_like(a_t)
-
-    # call Triton kernel with (a_t, b_t, c_t)
-    add_kernel.kernel(a_t, b_t, c_t, BLOCK_SIZE=1024)
-
-    # write back to LLAISYS output if needed
-    from_torch_to_ptr(c_t, out)
+    # 2. 直接将 Wrapper 对象传递给 Triton 内核的启动器
+    # Triton JIT 将会调用 wrapper 对象的 data_ptr() 和 .dtype 等属性
+    add_kernel.kernel(a_wrapped, b_wrapped, out_wrapped, BLOCK_SIZE=1024)
 
     return out
 
