@@ -863,24 +863,22 @@ def llaisysSwiGLU(out, gate, up):
 
 
 def llaisysROPE(out, inp, pos_ids, theta: float):
-    """Launcher for RoPE (rotation positional embeddings).
+    """Torch-free launcher for RoPE.
 
-    Computes in-place: out = rope(inp, pos_ids, theta)
-    This launcher uses PyTorch on the device for simplicity and correctness.
+    Minimal change: compute `pos` and `freqs` on host, upload as device tensors,
+    and call the Triton kernel using `LLAITensorAdapter` wrappers.
     """
-    # Convert inputs to torch tensors on device
-    x_t = to_torch_tensor(inp) if not isinstance(inp, torch.Tensor) else inp
-    pos_t = to_torch_tensor(pos_ids) if not isinstance(pos_ids, torch.Tensor) else pos_ids
+    # Wrap inputs/outputs
+    inp_wr = LLAITensorAdapter(inp)
+    out_wr = LLAITensorAdapter(out)
+    pos_wr_raw = LLAITensorAdapter(pos_ids)
 
     # validate shapes
-    assert x_t.dim() == 3
-    seq_len, n_heads, head_dim = x_t.shape
+    seq_len, n_heads, head_dim = inp_wr.shape
     assert head_dim % 2 == 0
+    half = head_dim // 2
 
-    # allocate output
-    out_t = torch.empty_like(x_t)
-
-    # coerce theta to float
+    # coerce theta
     try:
         if hasattr(theta, "value"):
             theta_val = float(theta.value)
@@ -889,18 +887,69 @@ def llaisysROPE(out, inp, pos_ids, theta: float):
     except Exception:
         theta_val = float(theta)
 
-    # prepare position ids and freqs on device as float32
-    pos_f32 = pos_t.to(dtype=torch.float32, device=x_t.device).contiguous()
-    half = head_dim // 2
-    i = torch.arange(0, half, dtype=torch.float32, device=x_t.device)
-    # freq multiplier = 1 / (theta ** (2*i/head_dim))
-    freqs = (theta_val ** (2.0 * i / float(head_dim))).reciprocal()
+    runtime = RuntimeAPI(DeviceType.NVIDIA)
 
-    # call Triton RoPE kernel: kernel expects x/out as (seq_len, n_heads, head_dim) tensors
-    rope_kernel.kernel(x_t.contiguous(), out_t.contiguous(), pos_f32, freqs, BLOCK=128)
+    # --- read pos_ids to host (use float64 for high precision) ---
+    pos_ptr = _get_raw_ptr(pos_ids)
+    p_ndim = int(LIB_LLAISYS.tensorGetNdim(pos_ptr))
+    p_shape_buf = (ctypes.c_size_t * p_ndim)()
+    LIB_LLAISYS.tensorGetShape(pos_ptr, p_shape_buf)
+    pos_numel = 1
+    for i_ in range(p_ndim):
+        pos_numel *= int(p_shape_buf[i_])
 
-    # write back to LLAISYS output
-    from_torch_to_ptr(out_t, out)
+    src_pos_dt = DataType(LIB_LLAISYS.tensorGetDataType(pos_ptr))
+    src_elem = get_element_size(src_pos_dt)
+    host_pos_buf = runtime.malloc_host(pos_numel * src_elem)
+    runtime.memcpy_sync(host_pos_buf, ctypes.c_void_p(LIB_LLAISYS.tensorGetData(pos_ptr)), pos_numel * src_elem, MemcpyKind.D2H)
+    host_pos_addr = ctypes.cast(host_pos_buf, ctypes.c_void_p).value
+    if src_pos_dt == DataType.I64:
+        pos_host = _np.ctypeslib.as_array((ctypes.c_int64 * pos_numel).from_address(host_pos_addr)).astype(_np.float64)
+    else:
+        pos_host = _np.ctypeslib.as_array((ctypes.c_int32 * pos_numel).from_address(host_pos_addr)).astype(_np.float64)
+
+    # --- compute freqs matrix and sin/cos on host in float64 for higher precision ---
+    indices = _np.arange(0, half, dtype=_np.float64)
+    freqs_1d = 1.0 / (theta_val ** (2.0 * indices / head_dim))
+    # broadcast multiply to get (seq_len, half)
+    freqs_mat = (pos_host.reshape(-1, 1) * freqs_1d.reshape(1, -1)).astype(_np.float64)
+
+    # compute sin/cos in float64 then cast to float32 for device
+    sin_host = _np.sin(freqs_mat).astype(_np.float32)
+    cos_host = _np.cos(freqs_mat).astype(_np.float32)
+
+    # flatten and upload sin and cos as temporary device tensors of shape (seq_len*half,)
+    flat_len = sin_host.size
+    sin_flat = sin_host.ravel()
+    cos_flat = cos_host.ravel()
+
+    sin_ptr = Tensor(shape=(flat_len,), dtype=DataType.F32, device=DeviceType.NVIDIA)
+    cos_ptr = Tensor(shape=(flat_len,), dtype=DataType.F32, device=DeviceType.NVIDIA)
+    # load data via host staging
+    host_buf_sin = runtime.malloc_host(sin_flat.nbytes)
+    ctypes.memmove(host_buf_sin, sin_flat.ctypes.data, sin_flat.nbytes)
+    LIB_LLAISYS.tensorLoad(sin_ptr.lib_tensor(), host_buf_sin)
+    runtime.free_host(host_buf_sin)
+
+    host_buf_cos = runtime.malloc_host(cos_flat.nbytes)
+    ctypes.memmove(host_buf_cos, cos_flat.ctypes.data, cos_flat.nbytes)
+    LIB_LLAISYS.tensorLoad(cos_ptr.lib_tensor(), host_buf_cos)
+    runtime.free_host(host_buf_cos)
+
+    sin_wr = LLAITensorAdapter(sin_ptr.lib_tensor())
+    cos_wr = LLAITensorAdapter(cos_ptr.lib_tensor())
+
+    # 4. call Triton kernel with precomputed sin/cos flattened arrays
+    rope_kernel.kernel(
+        inp_wr,
+        out_wr,
+        sin_wr,
+        cos_wr,
+        BLOCK=128,
+    )
+
+    # destroy temporary host pos buffer
+    runtime.free_host(host_pos_buf)
 
     return out
 

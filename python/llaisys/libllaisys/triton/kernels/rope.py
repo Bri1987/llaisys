@@ -9,7 +9,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _rope_kernel(x_ptr, out_ptr, pos_ptr, freqs_ptr, seq_len, n_heads, head_dim, HALF: tl.constexpr, BLOCK: tl.constexpr):
+def _rope_kernel(x_ptr, out_ptr, sin_ptr, cos_ptr, seq_len, n_heads, head_dim, HALF: tl.constexpr, BLOCK: tl.constexpr):
     # program ids: row_index enumerates seq_len * n_heads
     row = tl.program_id(0)
     col_block = tl.program_id(1)
@@ -32,15 +32,10 @@ def _rope_kernel(x_ptr, out_ptr, pos_ptr, freqs_ptr, seq_len, n_heads, head_dim,
     a = tl.load(x_ptr + a_idx, mask=mask, other=0.0).to(tl.float32)
     b = tl.load(x_ptr + b_idx, mask=mask, other=0.0).to(tl.float32)
 
-    # load position and freqs
-    pos = tl.load(pos_ptr + seq)
-    pos = pos.to(tl.float32)
-
-    freq = tl.load(freqs_ptr + cols, mask=mask, other=0.0)
-    # compute angle = pos * freq (broadcasting scalar pos over freq vector)
-    angle = pos * freq
-    cos_v = tl.cos(angle)
-    sin_v = tl.sin(angle)
+    # load precomputed sin/cos values for this (seq, half) block
+    base = seq * HALF
+    sin_v = tl.load(sin_ptr + (base + cols), mask=mask, other=0.0).to(tl.float32)
+    cos_v = tl.load(cos_ptr + (base + cols), mask=mask, other=1.0).to(tl.float32)
 
     y_a = a * cos_v - b * sin_v
     y_b = b * cos_v + a * sin_v
@@ -50,22 +45,18 @@ def _rope_kernel(x_ptr, out_ptr, pos_ptr, freqs_ptr, seq_len, n_heads, head_dim,
     tl.store(out_ptr + b_idx, y_b, mask=mask)
 
 
-def kernel(x, out, pos_ids, freqs, BLOCK=128):
-    """Launch the RoPE kernel.
+def kernel(x, out, sin, cos, BLOCK=128):
+    """Launch the RoPE kernel using precomputed sin/cos arrays.
 
-    x/out: 3D tensors flattened as 1D torch tensors (contiguous view)
-    pos_ids: 1D tensor length seq_len
-    freqs: 1D tensor length head_dim//2
+    x/out: 3D tensors flattened as 1D contiguous tensors
+    sin/cos: 1D flattened arrays of length seq_len * (head_dim//2)
     """
     seq_len = x.shape[0]
-    # x provided as flattened vector but we need shapes; expect user to pass shape via freqs len
-    # here we infer head_dim from freqs
-    HALF = freqs.shape[0]
-    # derive head_dim and n_heads from x and pos_ids: x.numel() = seq_len * n_heads * head_dim
     total_elems = x.numel()
-    # head_dim = HALF * 2
+    # infer HALF from sin length divided by seq_len
+    HALF = sin.shape[0] // seq_len
     head_dim = HALF * 2
     n_heads = total_elems // (seq_len * head_dim)
 
     grid = (seq_len * n_heads, (HALF + BLOCK - 1) // BLOCK)
-    _rope_kernel[grid](x, out, pos_ids, freqs, seq_len, n_heads, head_dim, HALF=HALF, BLOCK=BLOCK)
+    _rope_kernel[grid](x, out, sin, cos, seq_len, n_heads, head_dim, HALF=HALF, BLOCK=BLOCK)
