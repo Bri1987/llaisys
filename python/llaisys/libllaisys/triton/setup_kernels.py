@@ -534,74 +534,83 @@ def llaisysLinear(out, inp, weight, bias):
 
     Converts inputs to torch tensors, launches Triton matmul kernel, writes back.
     """
+    # Torch-free implementation: use LLAISYS device tensors and adapters.
+    # Keep the original logic/semantics (M,N,K, output dtype flags) but avoid creating torch tensors.
+    # Wrap inputs
+    x_wr = LLAITensorAdapter(inp)
+    w_wr = LLAITensorAdapter(weight)
+
+    # Validate 2D
+    if len(x_wr.shape) != 2 or len(w_wr.shape) != 2:
+        raise RuntimeError(f"Triton linear expects 2D tensors: got x.shape={x_wr.shape} w.shape={w_wr.shape}")
+
+    M, K = x_wr.shape
+    N = w_wr.shape[0]
+
+    # determine device id from input tensor
+    in_ptr = _get_raw_ptr(inp)
+    device_id = int(LIB_LLAISYS.tensorGetDeviceId(in_ptr))
+
+    # determine output dtype from weight (keep previous behavior: out dtype == weight dtype)
+    w_ptr = _get_raw_ptr(weight)
+    w_dtype = DataType(LIB_LLAISYS.tensorGetDataType(w_ptr))
+
+    # create temporary output device tensor with same dtype as weight
+    out_tmp = Tensor(shape=(M, N), dtype=w_dtype, device=DeviceType.NVIDIA, device_id=device_id)
+    out_wr = LLAITensorAdapter(out_tmp.lib_tensor())
+
+    # prepare bias tensor
+    runtime = RuntimeAPI(DeviceType.NVIDIA)
+    if bias is not None:
+        b_wr = LLAITensorAdapter(bias)
+    else:
+        # create N zeros float32 bias (matching previous implementation behavior)
+        zeros = _np.zeros((N,), dtype=_np.float32)
+        host_buf = runtime.malloc_host(zeros.nbytes)
+        ctypes.memmove(host_buf, zeros.ctypes.data, zeros.nbytes)
+        b_tmp = Tensor(shape=(N,), dtype=DataType.F32, device=DeviceType.NVIDIA, device_id=device_id)
+        LIB_LLAISYS.tensorLoad(b_tmp.lib_tensor(), host_buf)
+        runtime.free_host(host_buf)
+        b_wr = LLAITensorAdapter(b_tmp.lib_tensor())
+
+    # determine OUT_FP flags
+    OUT_FP32 = (w_dtype == DataType.F32)
+    OUT_FP16 = (w_dtype == DataType.F16)
+    OUT_BF16 = (w_dtype == DataType.BF16)
+
+    # grid sizes (match previous tiling)
+    grid_m = (M + 32 - 1) // 32
+    grid_n = (N + 32 - 1) // 32
+
+    # Launch kernel using adapters (no torch tensors)
+    linear_kernel._kernel[(grid_m, grid_n)](
+        x_wr,
+        w_wr,
+        out_wr,
+        b_wr,
+        M,
+        N,
+        K,
+        BLOCK_M=32,
+        BLOCK_N=32,
+        BLOCK_K=16,
+        OUT_FP32=OUT_FP32,
+        OUT_FP16=OUT_FP16,
+        OUT_BF16=OUT_BF16,
+    )
+
+    # copy result device->device into user-provided `out` tensor
+    out_ptr = _get_raw_ptr(out)
+    out_tmp_data = LIB_LLAISYS.tensorGetData(out_tmp.lib_tensor())
+    out_dst_data = LIB_LLAISYS.tensorGetData(out_ptr)
+    elem_size = get_element_size(w_dtype)
+    size_bytes = int(M) * int(N) * int(elem_size)
     try:
-        # Convert inputs to torch tensors (device tensors expected)
-        x_t = to_torch_tensor(inp) if not isinstance(inp, torch.Tensor) else inp
-        w_t = to_torch_tensor(weight) if not isinstance(weight, torch.Tensor) else weight
-
-        b_t = None
-        if bias is not None:
-            b_t = to_torch_tensor(bias) if not isinstance(bias, torch.Tensor) else bias
-
-        # Debug prints to help locate failures during conversion / kernel launch
-        # try:
-        #     print(f"[triton.linear] x.shape={getattr(x_t, 'shape', None)} x.dtype={getattr(x_t, 'dtype', None)} device={getattr(x_t, 'device', None)}")
-        #     print(f"[triton.linear] w.shape={getattr(w_t, 'shape', None)} w.dtype={getattr(w_t, 'dtype', None)} device={getattr(w_t, 'device', None)}")
-        #     print(f"[triton.linear] bias present={b_t is not None}")
-        # except Exception:
-        #     pass
-
-        # Expect 2D inputs
-        if x_t.dim() != 2 or w_t.dim() != 2:
-            raise RuntimeError(f"Triton linear expects 2D tensors: got x.dim={x_t.dim()} w.dim={w_t.dim()}")
-
-        M, K = x_t.shape
-        N = w_t.shape[0]
-
-        # allocate output on weight device to match kernel expectations
-        out_t = torch.empty((M, N), dtype=w_t.dtype, device=w_t.device)
-
-        # ensure contiguity
-        x_flat = x_t.contiguous()
-        w_flat = w_t.contiguous()
-        out_flat = out_t.contiguous()
-        if b_t is not None:
-            b_flat = b_t.contiguous()
-        else:
-            # pass an empty 1-D tensor (Triton will load zeros via mask)
-            b_flat = torch.zeros((N,), dtype=torch.float32, device=x_t.device)
-
-        # determine output dtype flags for Triton kernel (constexpr params)
-        OUT_FP32 = (out_t.dtype == torch.float32)
-        OUT_FP16 = (out_t.dtype == torch.float16)
-        OUT_BF16 = (out_t.dtype == torch.bfloat16)
-
-        # Debug: report grid and block sizes
-        grid_m = (M + 32 - 1) // 32
-        grid_n = (N + 32 - 1) // 32
-        # print(f"[triton.linear] launching kernel grid=({grid_m},{grid_n}) M={M} N={N} K={K} out_dtype={out_t.dtype}")
-
-        # Launch kernel
-        linear_kernel._kernel[(grid_m, grid_n)](
-            x_flat, w_flat, out_flat, b_flat, M, N, K,
-            BLOCK_M=32, BLOCK_N=32, BLOCK_K=16,
-            OUT_FP32=OUT_FP32, OUT_FP16=OUT_FP16, OUT_BF16=OUT_BF16,
-        )
-
-        # write back
-        from_torch_to_ptr(out_t, out)
-
-        return out
+        runtime.memcpy_sync(ctypes.c_void_p(out_dst_data), ctypes.c_void_p(out_tmp_data), size_bytes, MemcpyKind.D2D)
     except Exception as e:
-        # Provide rich debug info before re-raising to surface root cause to user
-        try:
-            # print(f"[triton.linear][ERROR] exception: {e}")
-            import traceback
+        raise RuntimeError(f"D2D memcpy failed when writing linear output: {e}") from e
 
-            traceback.print_exc()
-        except Exception:
-            pass
-        raise
+    return out
 
 
 def llaisysRmsNorm(out, inp, weight, eps: float):
