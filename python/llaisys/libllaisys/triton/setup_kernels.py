@@ -2,7 +2,6 @@ from .kernels import add as add_kernel
 from .kernels import argmax as argmax_kernel
 from .kernels import embedding as embedding_kernel
 from .kernels import linear as linear_kernel
-from .kernels import rearrange as rearrange_kernel
 from .kernels import rms_norm as rms_norm_kernel    
 from .kernels import rope as rope_kernel
 from .kernels import self_attention as self_attention_kernel
@@ -494,25 +493,6 @@ def llaisysLinear(out, inp, weight, bias):
         except Exception:
             pass
         raise
-
-
-def llaisysRearrange(out, inp):
-    """Launcher for rearrange: convert inputs, run simple rearrange (copy) and write back.
-
-    This implementation uses the device torch tensor path and performs an identity
-    copy. It exists to validate the Ops->Triton bridge; an optimized rearrange
-    kernel can be substituted in `kernels/rearrange.py` later.
-    """
-    x_t = to_torch_tensor(inp) if not isinstance(inp, torch.Tensor) else inp
-
-    out_t = torch.empty_like(x_t)
-    # call kernel
-    rearrange_kernel.kernel(x_t, out_t)
-
-    # write back
-    from_torch_to_ptr(out_t, out)
-
-    return out
 
 
 def llaisysRmsNorm(out, inp, weight, eps: float):

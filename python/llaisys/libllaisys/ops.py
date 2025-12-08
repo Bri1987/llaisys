@@ -14,9 +14,6 @@ def load_ops(lib):
     lib.llaisysLinear.argtypes = [llaisysTensor_t, llaisysTensor_t, llaisysTensor_t, llaisysTensor_t]
     lib.llaisysLinear.restype = None
 
-    lib.llaisysRearrange.argtypes = [llaisysTensor_t, llaisysTensor_t]
-    lib.llaisysRearrange.restype = None
-
     lib.llaisysRmsNorm.argtypes = [llaisysTensor_t, llaisysTensor_t, llaisysTensor_t, c_float]
     lib.llaisysRmsNorm.restype = None
 

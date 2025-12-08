@@ -38,9 +38,6 @@ class Ops:
                 out.lib_tensor(), inp.lib_tensor(), weight.lib_tensor(), bias.lib_tensor()
             )
 
-    @staticmethod
-    def rearrange(out: Tensor, inp: Tensor):
-        _CURRENT_LIB.llaisysRearrange(out.lib_tensor(), inp.lib_tensor())
 
     @staticmethod
     def rms_norm(out: Tensor, inp: Tensor, weight: Tensor, eps: float):
