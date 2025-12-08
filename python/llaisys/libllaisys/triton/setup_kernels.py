@@ -394,32 +394,29 @@ def llaisysArgmax(max_idx_out, max_val_out, vals):
 
 
 def llaisysEmbedding(out, index, weight):
-    """Launcher for Triton-backed embedding.
-
-    Converts LLAISYS handles to CUDA torch tensors, runs the Triton kernel,
-    and writes back the output.
     """
-    # convert inputs to torch tensors if needed
-    index_t = to_torch_tensor(index) if not isinstance(index, torch.Tensor) else index
-    weight_t = to_torch_tensor(weight) if not isinstance(weight, torch.Tensor) else weight
+    [原创无 Torch 版] Launcher for Triton-backed embedding.
+    """
+    # 1. 将 llaisys.Tensor 包装成 Triton 兼容的对象
+    index_wrapped = LLAITensorAdapter(index)
+    weight_wrapped = LLAITensorAdapter(weight)
+    out_wrapped = LLAITensorAdapter(out)
 
-    # ensure index is int32 on device for Triton kernel
-    if index_t.dtype != torch.int32:
-        index_i32 = index_t.to(dtype=torch.int32)
-    else:
-        index_i32 = index_t
+    # 2. 从 wrapper 中获取维度信息
+    # N 是 index 的元素数量
+    N = index_wrapped.numel() 
+    # D 是 embedding 的维度
+    D = weight_wrapped.shape[1]
 
-    N = index_i32.numel()
-    D = weight_t.shape[1]
-
-    # allocate output on device with same dtype as weight
-    out_t = torch.empty((N, D), dtype=weight_t.dtype, device=weight_t.device)
-
-    # call Triton kernel
-    embedding_kernel.kernel(index_i32, weight_t, out_t, N, D, BLOCK_SIZE=1024)
-
-    # write back
-    from_torch_to_ptr(out_t, out)
+    # 3. 直接将 Wrapper 对象传递给 Triton 内核的启动器
+    embedding_kernel.kernel(
+        index_wrapped, 
+        weight_wrapped, 
+        out_wrapped, 
+        N, 
+        D, 
+        BLOCK_SIZE=1024
+    )
 
     return out
 
