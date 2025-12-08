@@ -40,7 +40,7 @@ def kernel(a, b, c, BLOCK_SIZE: int = 1024):
 
     Args:
         a, b, c: Objects that mimic a tensor interface for Triton,
-                 like TritonTensorWrapper or torch.Tensor.
+                 like LLAITensorAdapter or torch.Tensor.
     """
     if triton is None:
         raise RuntimeError("Triton not found.")
@@ -51,9 +51,9 @@ def kernel(a, b, c, BLOCK_SIZE: int = 1024):
 
     # 【核心】直接将 wrapper 对象传递给 JIT 内核
     _kernel[grid](
-        a,  # a 是 TritonTensorWrapper 对象
-        b,  # b 是 TritonTensorWrapper 对象
-        c,  # c 是 TritonTensorWrapper 对象
+        a,  # a 是 LLAITensorAdapter 对象
+        b,  # b 是 LLAITensorAdapter 对象
+        c,  # c 是 LLAITensorAdapter 对象
         n_elements, 
         BLOCK_SIZE=BLOCK_SIZE,
     )
