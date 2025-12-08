@@ -31,9 +31,12 @@ class Ops:
 
     @staticmethod
     def linear(out: Tensor, inp: Tensor, weight: Tensor, bias: Tensor):
-        _CURRENT_LIB.llaisysLinear(
-            out.lib_tensor(), inp.lib_tensor(), weight.lib_tensor(), bias.lib_tensor()
-        )
+        if bias is None:
+            _CURRENT_LIB.llaisysLinear(out.lib_tensor(), inp.lib_tensor(), weight.lib_tensor(), None)
+        else:
+            _CURRENT_LIB.llaisysLinear(
+                out.lib_tensor(), inp.lib_tensor(), weight.lib_tensor(), bias.lib_tensor()
+            )
 
     @staticmethod
     def rearrange(out: Tensor, inp: Tensor):
@@ -52,14 +55,33 @@ class Ops:
         )
 
     @staticmethod
-    def self_attention(attn_val: Tensor, q: Tensor, k: Tensor, v: Tensor, scale: float):
-        _CURRENT_LIB.llaisysSelfAttention(
-            attn_val.lib_tensor(),
-            q.lib_tensor(),
-            k.lib_tensor(),
-            v.lib_tensor(),
-            c_float(scale),
-        )
+    def self_attention(attn_val: Tensor, q: Tensor, k: Tensor, v: Tensor, scale: float, past_k: Tensor = None, past_v: Tensor = None):
+        """Run self-attention; optionally supply `past_k` and `past_v` LLAISYS Tensors.
+
+        This will attempt to call the Triton launcher with the extended
+        arguments; if the underlying lib does not support the extended
+        signature (C backend), it falls back to the original 5-arg call.
+        """
+        try:
+            # Preferred: call the backend launcher with LLAISYS Tensor objects
+            _CURRENT_LIB.llaisysSelfAttention(
+                attn_val,
+                q,
+                k,
+                v,
+                c_float(scale),
+                past_k,
+                past_v,
+            )
+        except TypeError:
+            # Fallback for backends that expect raw llaisysTensor handles
+            _CURRENT_LIB.llaisysSelfAttention(
+                attn_val.lib_tensor(),
+                q.lib_tensor(),
+                k.lib_tensor(),
+                v.lib_tensor(),
+                c_float(scale),
+            )
 
     @staticmethod
     def swiglu(out: Tensor, gate: Tensor, up: Tensor):

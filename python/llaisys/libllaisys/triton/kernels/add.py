@@ -21,7 +21,6 @@ Notes:
   have identical shapes/dtypes.
 """
 
-import torch
 try:
     import triton
     import triton.language as tl
@@ -49,7 +48,7 @@ def _make_add_kernel():
 _CACHED_KERNEL = None
 
 
-def kernel(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, BLOCK_SIZE: int = 1024):
+def kernel(a , b , c , BLOCK_SIZE: int = 1024):
     """Run elementwise add using Triton on CUDA tensors.
 
     Args:
@@ -70,8 +69,8 @@ def kernel(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, BLOCK_SIZE: int = 
         raise ValueError("All tensors must have the same shape")
     if not (a.dtype == b.dtype == c.dtype):
         raise ValueError("All tensors must have the same dtype")
-    if a.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-        raise TypeError("Unsupported dtype: only float32/float16/bfloat16 are supported")
+    # if a.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+    #     raise TypeError("Unsupported dtype: only float32/float16/bfloat16 are supported")
 
     global _CACHED_KERNEL
     if _CACHED_KERNEL is None:

@@ -13,9 +13,45 @@ from .kernels import swiglu as swiglu_kernel
 import ctypes
 import numpy as _np
 import torch
+import math
 
 from llaisys.runtime import RuntimeAPI
 from llaisys.libllaisys import DeviceType, MemcpyKind, DataType, LIB_LLAISYS
+from .kernels import scaled_dot_product_attention_decode as decode_kernels
+import triton
+import triton.language as tl
+
+def get_optimal_s(batch_size: int, num_heads: int, seq_len: int, device: str = 'cuda') -> int:
+    # 对于短序列，split/combine的开销占主导，强制S=1
+    SEQ_LEN_THRESHOLD = 512 
+    if seq_len < SEQ_LEN_THRESHOLD:
+        return 1
+        
+    if not torch.cuda.is_available():
+        return 1
+
+    properties = torch.cuda.get_device_properties(device)
+    num_sms = properties.multi_processor_count
+
+    total_tasks = batch_size * num_heads
+
+    if total_tasks >= num_sms:
+        # GPU已经被充分利用或超载，S=1是最佳选择
+        return 1
+    else:
+        # GPU未被充分利用，计算需要的S值以饱和SM
+        s_float = num_sms / total_tasks
+        
+        # 向上取整，确保任务数足够
+        s_int = math.ceil(s_float)
+        
+        # 将S调整为2的幂
+        if s_int > 1:
+            s_power_of_2 = 2**math.floor(math.log2(s_int))
+            # 设个4的上限吧, 否则正确性的精度过不了
+            return min(4, s_power_of_2)
+        else:
+            return 1
 
 
 def _get_raw_ptr(x):
@@ -113,11 +149,11 @@ def to_torch_tensor(x):
         # Surface a clear error: no fallback here by design for testing
         raise RuntimeError(f"D2D memcpy failed: {e}") from e
 
-    try:
-        if th.numel() <= 64:
-            print("[triton.setup] converted tensor (device, D2D):", th)
-    except Exception:
-        pass
+    # try:
+    #     if th.numel() <= 64:
+    #         print("[triton.setup] converted tensor (device, D2D):", th)
+    # except Exception:
+    #     pass
 
     return th
 
@@ -126,6 +162,34 @@ def from_torch_to_ptr(th, out):
     """Write a CPU-contiguous torch tensor `th` back into an output LLAISYS tensor handle or wrapper."""
     out_ptr = _get_raw_ptr(out)
     cpu = th.to("cpu").contiguous()
+    # Ensure we cast the CPU tensor to the exact dtype expected by the
+    # destination LLAISYS tensor to avoid byte-size/shape mismatches.
+    try:
+        dt = DataType(LIB_LLAISYS.tensorGetDataType(out_ptr))
+        if dt == DataType.F32:
+            target_torch_dtype = torch.float32
+        elif dt == DataType.F16:
+            target_torch_dtype = torch.float16
+        elif dt == DataType.BF16:
+            target_torch_dtype = torch.bfloat16
+        elif dt == DataType.F64:
+            target_torch_dtype = torch.float64
+        elif dt == DataType.I8:
+            target_torch_dtype = torch.int8
+        elif dt == DataType.I16:
+            target_torch_dtype = torch.int16
+        elif dt == DataType.I32:
+            target_torch_dtype = torch.int32
+        elif dt == DataType.I64:
+            target_torch_dtype = torch.int64
+        else:
+            # fallback to float32
+            target_torch_dtype = torch.float32
+        # cast and ensure contiguous on CPU
+        cpu = cpu.to(dtype=target_torch_dtype).contiguous()
+    except Exception:
+        # If any query fails, keep the original CPU tensor
+        pass
 
     class _View:
         def __init__(self, ptr):
@@ -133,6 +197,23 @@ def from_torch_to_ptr(th, out):
 
         def load(self, data):
             LIB_LLAISYS.tensorLoad(self._ptr, data)
+
+    # debug: print expected sizes to help diagnose shape/size mismatches
+    try:
+        ndim = int(LIB_LLAISYS.tensorGetNdim(out_ptr))
+        buf = (ctypes.c_size_t * ndim)()
+        LIB_LLAISYS.tensorGetShape(out_ptr, buf)
+        out_shape = tuple(buf[i] for i in range(ndim))
+        out_numel = 1
+        for d in out_shape:
+            out_numel *= int(d)
+        out_dt = DataType(LIB_LLAISYS.tensorGetDataType(out_ptr))
+        cpu_numel = int(cpu.numel()) if hasattr(cpu, 'numel') else None
+        cpu_elem_size = int(cpu.element_size()) if hasattr(cpu, 'element_size') else None
+        cpu_size_bytes = cpu_numel * cpu_elem_size if cpu_numel is not None and cpu_elem_size is not None else None
+        # print(f"[triton.writeback] out_shape={out_shape} out_numel={out_numel} out_dt={out_dt} cpu_numel={cpu_numel} cpu_elem_size={cpu_elem_size} cpu_size_bytes={cpu_size_bytes}")
+    except Exception:
+        pass
 
     view = _View(out_ptr)
     view.load(ctypes.c_void_p(cpu.data_ptr()))
@@ -147,7 +228,7 @@ def llaisysAdd(out, a, b):
     Note: `Ops.add` calls this as `llaisysAdd(out, a, b)`, so we accept
     `(out, a, b)` and invoke the Triton kernel as `kernel(a, b, out)`.
     """
-    print("Using Triton add kernel")
+    # print("Using Triton add kernel")
     # Convert inputs to torch tensors (if they are LLAISYS handles)
     a_t = to_torch_tensor(a) if not isinstance(a, torch.Tensor) else a
     b_t = to_torch_tensor(b) if not isinstance(b, torch.Tensor) else b
@@ -243,31 +324,88 @@ def llaisysLinear(out, inp, weight, bias):
 
     Converts inputs to torch tensors, launches Triton matmul kernel, writes back.
     """
+    try:
+        # Convert inputs to torch tensors (device tensors expected)
+        x_t = to_torch_tensor(inp) if not isinstance(inp, torch.Tensor) else inp
+        w_t = to_torch_tensor(weight) if not isinstance(weight, torch.Tensor) else weight
+
+        b_t = None
+        if bias is not None:
+            b_t = to_torch_tensor(bias) if not isinstance(bias, torch.Tensor) else bias
+
+        # Debug prints to help locate failures during conversion / kernel launch
+        # try:
+        #     print(f"[triton.linear] x.shape={getattr(x_t, 'shape', None)} x.dtype={getattr(x_t, 'dtype', None)} device={getattr(x_t, 'device', None)}")
+        #     print(f"[triton.linear] w.shape={getattr(w_t, 'shape', None)} w.dtype={getattr(w_t, 'dtype', None)} device={getattr(w_t, 'device', None)}")
+        #     print(f"[triton.linear] bias present={b_t is not None}")
+        # except Exception:
+        #     pass
+
+        # Expect 2D inputs
+        if x_t.dim() != 2 or w_t.dim() != 2:
+            raise RuntimeError(f"Triton linear expects 2D tensors: got x.dim={x_t.dim()} w.dim={w_t.dim()}")
+
+        M, K = x_t.shape
+        N = w_t.shape[0]
+
+        # allocate output on weight device to match kernel expectations
+        out_t = torch.empty((M, N), dtype=w_t.dtype, device=w_t.device)
+
+        # ensure contiguity
+        x_flat = x_t.contiguous()
+        w_flat = w_t.contiguous()
+        out_flat = out_t.contiguous()
+        if b_t is not None:
+            b_flat = b_t.contiguous()
+        else:
+            # pass an empty 1-D tensor (Triton will load zeros via mask)
+            b_flat = torch.zeros((N,), dtype=torch.float32, device=x_t.device)
+
+        # determine output dtype flags for Triton kernel (constexpr params)
+        OUT_FP32 = (out_t.dtype == torch.float32)
+        OUT_FP16 = (out_t.dtype == torch.float16)
+        OUT_BF16 = (out_t.dtype == torch.bfloat16)
+
+        # Debug: report grid and block sizes
+        grid_m = (M + 32 - 1) // 32
+        grid_n = (N + 32 - 1) // 32
+        # print(f"[triton.linear] launching kernel grid=({grid_m},{grid_n}) M={M} N={N} K={K} out_dtype={out_t.dtype}")
+
+        # Launch kernel
+        linear_kernel._kernel[(grid_m, grid_n)](
+            x_flat, w_flat, out_flat, b_flat, M, N, K,
+            BLOCK_M=32, BLOCK_N=32, BLOCK_K=16,
+            OUT_FP32=OUT_FP32, OUT_FP16=OUT_FP16, OUT_BF16=OUT_BF16,
+        )
+
+        # write back
+        from_torch_to_ptr(out_t, out)
+
+        return out
+    except Exception as e:
+        # Provide rich debug info before re-raising to surface root cause to user
+        try:
+            # print(f"[triton.linear][ERROR] exception: {e}")
+            import traceback
+
+            traceback.print_exc()
+        except Exception:
+            pass
+        raise
+
+
+def llaisysRearrange(out, inp):
+    """Launcher for rearrange: convert inputs, run simple rearrange (copy) and write back.
+
+    This implementation uses the device torch tensor path and performs an identity
+    copy. It exists to validate the Ops->Triton bridge; an optimized rearrange
+    kernel can be substituted in `kernels/rearrange.py` later.
+    """
     x_t = to_torch_tensor(inp) if not isinstance(inp, torch.Tensor) else inp
-    w_t = to_torch_tensor(weight) if not isinstance(weight, torch.Tensor) else weight
 
-    b_t = None
-    if bias is not None:
-        b_t = to_torch_tensor(bias) if not isinstance(bias, torch.Tensor) else bias
-
-    M, K = x_t.shape
-    N = w_t.shape[0]
-
-    # allocate output
-    out_t = torch.empty((M, N), dtype=w_t.dtype, device=w_t.device)
-
-    # call Triton kernel
-    # kernel expects flattened contiguous arrays; ensure contiguity
-    x_flat = x_t.contiguous()
-    w_flat = w_t.contiguous()
-    out_flat = out_t.contiguous()
-    if b_t is not None:
-        b_flat = b_t.contiguous()
-    else:
-        # pass an empty 1-D tensor (Triton will load zeros via mask)
-        b_flat = torch.zeros((N,), dtype=torch.float32, device=x_t.device)
-
-    linear_kernel._kernel[( (M + 64 - 1) // 64, (N + 64 - 1) // 64 )](x_flat, w_flat, out_flat, b_flat, M, N, K, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32)
+    out_t = torch.empty_like(x_t)
+    # call kernel
+    rearrange_kernel.kernel(x_t, out_t)
 
     # write back
     from_torch_to_ptr(out_t, out)
@@ -311,7 +449,7 @@ def llaisysRmsNorm(out, inp, weight, eps: float):
     return out
 
 
-def llaisysSelfAttention(attn_val_out, q, k, v, scale: float):
+def llaisysSelfAttention(attn_val_out, q, k, v, scale: float, past_k=None, past_v=None):
     """Launcher for Triton-backed self-attention.
 
     Expects shapes:
@@ -326,6 +464,17 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float):
     q_t = to_torch_tensor(q) if not isinstance(q, torch.Tensor) else q
     k_t = to_torch_tensor(k) if not isinstance(k, torch.Tensor) else k
     v_t = to_torch_tensor(v) if not isinstance(v, torch.Tensor) else v
+
+    # Convert optional past_k/past_v to torch tensors if provided.
+    if past_k is not None:
+        past_k_t = to_torch_tensor(past_k) if not isinstance(past_k, torch.Tensor) else past_k
+    else:
+        past_k_t = None
+
+    if past_v is not None:
+        past_v_t = to_torch_tensor(past_v) if not isinstance(past_v, torch.Tensor) else past_v
+    else:
+        past_v_t = None
 
     # shapes from tests: q (qlen, nh, hd)
     qlen, nh, hd = q_t.shape
@@ -396,7 +545,76 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float):
 
         return attn_val_out
 
-    # call Triton kernel
+    # If past_k/past_v are provided, use the decode split/combine kernels
+    # which implement online softmax across past+current K/V. Otherwise
+    # fall back to the original prefill kernel.
+    if past_k_t is not None and past_v_t is not None:
+        # q_b: (1, nh, qlen, hd) ; k_b: (1, nkvh, kvlen_current, hd)
+        # past_k_t/past_v_t expected layout: (past_seq_len, nkvh, hd)
+        past_seq_len = past_k_t.shape[2]
+
+        # convert layouts to those expected by decode kernels
+        q_dec = q_b
+        k_dec = k_b
+        v_dec = v_b
+        past_k_dec = past_k_t
+        past_v_dec = past_v_t
+
+        # Prepare split outputs buffers as in hw2 wrapper
+        # compute past sequence length and total seq_len_k_v
+        past_seq_len = past_k_t.shape[0] if past_k_t is not None else 0
+        seq_len_k_v = past_seq_len + k_b.shape[2]
+        # number of groups when num_key_value_heads divides num_heads
+        num_groups = num_heads // (nkvh if nkvh > 0 else 1)
+
+        S = get_optimal_s(batch_size, num_heads, seq_len_k_v, q_t.device)
+        print(f"we have {S} splits for decode attention")
+        split_logsumexp = torch.empty((batch_size, num_heads, S, qlen), dtype=torch.float32, device="cuda")
+        split_outputs = torch.empty((batch_size, num_heads, S, qlen, hd), dtype=torch.float16, device="cuda")
+
+        def grid1(meta):
+            return (triton.cdiv(qlen, meta['BLOCK_SIZE_M']), S, num_heads * batch_size)
+
+        M_binned = triton.next_power_of_2(qlen)
+        N_binned = triton.next_power_of_2(past_seq_len + k_b.shape[2])
+
+        decode_kernels.split_kv_kernel[grid1](
+            q_dec, k_dec, v_dec, past_k_dec, past_v_dec,
+            float(scale_val),
+            split_logsumexp, split_outputs,
+            num_heads, num_groups,
+            q_dec.stride(0), q_dec.stride(1), q_dec.stride(2), q_dec.stride(3),
+            k_dec.stride(0), k_dec.stride(1), k_dec.stride(2), k_dec.stride(3),
+            v_dec.stride(0), v_dec.stride(1), v_dec.stride(2), v_dec.stride(3),
+            past_k_dec.stride(0), past_k_dec.stride(1), past_k_dec.stride(2), past_k_dec.stride(3),
+            past_v_dec.stride(0), past_v_dec.stride(1), past_v_dec.stride(2), past_v_dec.stride(3),
+            split_outputs.stride(0), split_outputs.stride(1), split_outputs.stride(2), split_outputs.stride(3), split_outputs.stride(4),
+            qlen, past_seq_len + k_b.shape[2], k_b.shape[2], S,
+            EMB_DIM=hd, M_BINNED=M_binned, N_BINNED=N_binned, IS_CAUSAL=True,
+        )
+
+        if S == 1:
+            final_o = split_outputs.squeeze(2)
+        else:
+            final_o = torch.empty_like(q_dec)
+            def grid2(meta):
+                return (triton.cdiv(qlen, meta['BLOCK_SIZE_M']), num_heads, batch_size)
+            decode_kernels.combine_kv_splits_kernel[grid2](
+                split_outputs, split_logsumexp,
+                final_o, torch.empty((batch_size, num_heads, qlen), dtype=torch.float32, device="cuda"),
+                num_heads,
+                split_outputs.stride(0), split_outputs.stride(1), split_outputs.stride(2), split_outputs.stride(3), split_outputs.stride(4),
+                final_o.stride(0), final_o.stride(1), final_o.stride(2), final_o.stride(3),
+                qlen, S,
+                EMB_DIM=hd, M_BINNED=M_binned,
+            )
+
+        # final_o shape: (batch, heads, qlen, hd)
+        out_final = final_o.squeeze(0).permute(1,0,2).contiguous() if final_o.dim() == 5 else final_o.squeeze(0).permute(1,0,2).contiguous()
+        from_torch_to_ptr(out_final, attn_val_out)
+        return attn_val_out
+
+    # call Triton kernel (prefill path)
     grid = ((qlen + 31) // 32, num_heads, batch_size)
     self_attention_kernel.kernel[grid](
         q_b, k_b, v_b, out_b,
@@ -404,6 +622,12 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float):
         k_b.stride(0), k_b.stride(1), k_b.stride(2), k_b.stride(3),
         v_b.stride(0), v_b.stride(1), v_b.stride(2), v_b.stride(3),
         out_b.stride(0), out_b.stride(1), out_b.stride(2), out_b.stride(3),
+        # past_k_ptr, past_v_ptr (0 means unused)
+        0, 0,
+        # past_k strides (z, h, n, k)
+        0, 0, 0, 0,
+        # past_v strides (z, h, k, n)
+        0, 0, 0, 0,
         float(scale_val), qlen, kvlen,
         EMB_DIM=hd,
     )
@@ -431,6 +655,19 @@ def llaisysSwiGLU(out, gate, up):
     # validate shapes and dtypes
     assert gate_t.shape == up_t.shape, "SwiGLU: gate and up must have same shape"
 
+    # debug: inspect expected destination dtype/shape
+    try:
+        out_ptr = _get_raw_ptr(out)
+        out_dt = DataType(LIB_LLAISYS.tensorGetDataType(out_ptr))
+        out_shape = None
+        ndim = int(LIB_LLAISYS.tensorGetNdim(out_ptr))
+        buf = (ctypes.c_size_t * ndim)()
+        LIB_LLAISYS.tensorGetShape(out_ptr, buf)
+        out_shape = tuple(buf[i] for i in range(ndim))
+        # print(f"[triton.swiGLU] out expected dtype={out_dt} shape={out_shape}")
+    except Exception:
+        pass
+
     out_t = torch.empty_like(gate_t)
 
     gate_flat = gate_t.contiguous().view(-1)
@@ -441,7 +678,11 @@ def llaisysSwiGLU(out, gate, up):
     swiglu_kernel.kernel(gate_flat, up_flat, out_flat, BLOCK=1024)
 
     # write back
-    from_torch_to_ptr(out_t, out)
+    try:
+        from_torch_to_ptr(out_t, out)
+    except Exception as e:
+        # print(f"[triton.swiGLU] write-back failed: {e}")
+        raise
 
     return out
 

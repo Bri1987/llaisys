@@ -30,10 +30,16 @@ import triton.language as tl
 @triton.jit
 def kernel(
     q_ptr, k_ptr, v_ptr, o_ptr,
+    # original strides
     q_stride_z, q_stride_h, q_stride_m, q_stride_k,
     k_stride_z, k_stride_h, k_stride_n, k_stride_k,
     v_stride_z, v_stride_h, v_stride_k, v_stride_n,
     o_stride_z, o_stride_h, o_stride_m, o_stride_n,
+    # optional past KV cache pointers/strides (set to 0 by launcher when unused)
+    past_k_ptr, past_v_ptr,
+    past_k_stride_z, past_k_stride_h, past_k_stride_n, past_k_stride_k,
+    past_v_stride_z, past_v_stride_h, past_v_stride_k, past_v_stride_n,
+    # lengths and scale
     scale, seq_len_q, seq_len_k_v,
     EMB_DIM: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
 ):
@@ -97,6 +103,39 @@ def kernel(
         k = tl.load(k_block_ptr, boundary_check=(0, 1))
         v = tl.load(v_block_ptr, boundary_check=(0, 1))
 
+        # If past KV cache pointers were provided (non-zero), write current
+        # k/v block into the cache at the corresponding offsets so that
+        # subsequent decode kernels can read them.
+        # We detect availability by checking past_k_ptr != 0.
+        if past_k_ptr != 0:
+            # compute base offsets for past_k/past_v for this batch/head
+            batch_head_offset_past_k = batch_index * past_k_stride_z + head_index * past_k_stride_h
+            batch_head_offset_past_v = batch_index * past_v_stride_z + head_index * past_v_stride_h
+
+            n_block_start = i * BLOCK_SIZE_N
+
+            past_k_block_ptr = tl.make_block_ptr(
+                base=past_k_ptr + batch_head_offset_past_k,
+                shape=(EMB_DIM, seq_len_k_v),
+                strides=(past_k_stride_k, past_k_stride_n),
+                offsets=(0, n_block_start),
+                block_shape=(EMB_DIM, BLOCK_SIZE_N),
+                order=(0, 1),
+            )
+
+            past_v_block_ptr = tl.make_block_ptr(
+                base=past_v_ptr + batch_head_offset_past_v,
+                shape=(seq_len_k_v, EMB_DIM),
+                strides=(past_v_stride_n, past_v_stride_k),
+                offsets=(n_block_start, 0),
+                block_shape=(BLOCK_SIZE_N, EMB_DIM),
+                order=(1, 0),
+            )
+
+            # store (let Triton handle masking/boundary)
+            tl.store(past_k_block_ptr, k, boundary_check=(0, 1))
+            tl.store(past_v_block_ptr, v, boundary_check=(0, 1))
+
         # compute QK^T for this block and apply scale
         mask = i * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N) < seq_len_k_v
         qk = tl.where(mask, tl.dot(q, k), float("-inf"))
@@ -124,4 +163,4 @@ def kernel(
 
     acc = acc / l_i[:, None]
     # store result (let Triton handle dtype casting)
-    tl.store(o_block_ptr, acc, boundary_check=(0, 1))
+    tl.store(o_block_ptr, acc.to(o_block_ptr.dtype.element_ty), boundary_check=(0, 1))
