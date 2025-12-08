@@ -19,6 +19,7 @@ from llaisys.libllaisys import DeviceType, MemcpyKind, DataType, LIB_LLAISYS
 from .kernels import scaled_dot_product_attention_decode as decode_kernels
 import triton
 import triton.language as tl
+from llaisys.tensor import Tensor
 
 def ptr_to_int(ptr):
     """Converts a ctypes pointer to an integer memory address."""
@@ -350,44 +351,152 @@ def llaisysAdd(out, a, b):
 
 
 def llaisysArgmax(max_idx_out, max_val_out, vals):
-    """Launcher for Triton argmax: convert inputs, run Triton kernels, write back."""
-    # convert vals to torch tensor on CUDA
-    vals_t = to_torch_tensor(vals) if not isinstance(vals, torch.Tensor) else vals
+    """Torch-free launcher for Triton argmax.
 
-    # remember original dtype so we can cast results back
-    orig_dtype = vals_t.dtype
-    # ensure we operate in float32 for comparison simplicity
-    if vals_t.dtype != torch.float32:
-        vals_f32 = vals_t.to(dtype=torch.float32)
-    else:
-        vals_f32 = vals_t
+    Strategy:
+    - If input dtype != F32, perform host-side cast to float32 and upload a temporary device tensor.
+    - Allocate device partial buffers and run Triton stage1/stage2 kernels.
+    - Download scalar results, cast to destination dtypes on host, and write back into the provided LLAISYS output tensors.
+    """
+    # Wrap input
+    vals_wr = LLAITensorAdapter(vals)
 
-    n = vals_f32.numel()
+    # element count
+    n = vals_wr.numel()
+
     # choose BLOCK_SIZE (power of two, up to 1024)
-    BLOCK_SIZE = 1024 if n >= 1024 else 1 << (n - 1).bit_length()
+    if n >= 1024:
+        BLOCK_SIZE = 1024
+    else:
+        # next power of two >= n
+        pow2 = 1
+        while pow2 < max(1, n):
+            pow2 <<= 1
+        BLOCK_SIZE = pow2
 
-    # compute number of blocks
     num_blocks = (n + BLOCK_SIZE - 1) // BLOCK_SIZE
 
+    runtime = RuntimeAPI(DeviceType.NVIDIA)
+
+    # ensure values are float32 on device for the Triton kernel
+    vals_for_kernel = None
+    src_ptr = _get_raw_ptr(vals)
+    src_dt = DataType(LIB_LLAISYS.tensorGetDataType(src_ptr))
+    if src_dt == DataType.F32:
+        vals_for_kernel = LLAITensorAdapter(vals)
+    else:
+        # copy to host, cast to float32, upload temporary device tensor
+        src_numel = vals_wr.numel()
+        src_elem = get_element_size(src_dt)
+        host_buf = runtime.malloc_host(src_numel * src_elem)
+        # D2H
+        runtime.memcpy_sync(host_buf, ctypes.c_void_p(LIB_LLAISYS.tensorGetData(src_ptr)), src_numel * src_elem, MemcpyKind.D2H)
+        host_addr = ctypes.cast(host_buf, ctypes.c_void_p).value
+
+        # build numpy view depending on dtype
+        if src_dt == DataType.F16:
+            raw = _np.ctypeslib.as_array((ctypes.c_uint16 * src_numel).from_address(host_addr))
+            # reinterpret uint16 bits as float16
+            arr = raw.view(_np.float16)
+        elif src_dt == DataType.BF16:
+            # stored as uint16; interpret then convert to float32 via bit-shift
+            raw = _np.ctypeslib.as_array((ctypes.c_uint16 * src_numel).from_address(host_addr)).astype(_np.uint16)
+            f32 = (raw.astype(_np.uint32) << 16).view(_np.float32)
+            arr = f32
+        elif src_dt in (DataType.I32, DataType.I64):
+            if src_dt == DataType.I64:
+                arr = _np.ctypeslib.as_array((ctypes.c_int64 * src_numel).from_address(host_addr)).astype(_np.float32)
+            else:
+                arr = _np.ctypeslib.as_array((ctypes.c_int32 * src_numel).from_address(host_addr)).astype(_np.float32)
+        else:
+            # fallback: treat as float32 bytes
+            arr = _np.ctypeslib.as_array((ctypes.c_float * src_numel).from_address(host_addr)).astype(_np.float32)
+
+        # cast to float32 host buffer
+        arr_f32 = arr.astype(_np.float32)
+        # upload
+        host_buf2 = runtime.malloc_host(arr_f32.nbytes)
+        ctypes.memmove(host_buf2, arr_f32.ctypes.data, arr_f32.nbytes)
+        tmp_vals = Tensor(shape=(src_numel,), dtype=DataType.F32, device=DeviceType.NVIDIA)
+        LIB_LLAISYS.tensorLoad(tmp_vals.lib_tensor(), host_buf2)
+        runtime.free_host(host_buf2)
+        runtime.free_host(host_buf)
+
+        vals_for_kernel = LLAITensorAdapter(tmp_vals.lib_tensor())
+
     # allocate partial buffers on device
-    partial_vals = torch.empty((num_blocks,), dtype=torch.float32, device=vals_f32.device)
-    partial_idx = torch.empty((num_blocks,), dtype=torch.int32, device=vals_f32.device)
+    partial_vals = Tensor(shape=(num_blocks,), dtype=DataType.F32, device=DeviceType.NVIDIA)
+    partial_idx = Tensor(shape=(num_blocks,), dtype=DataType.I32, device=DeviceType.NVIDIA)
+    partial_vals_wr = LLAITensorAdapter(partial_vals.lib_tensor())
+    partial_idx_wr = LLAITensorAdapter(partial_idx.lib_tensor())
 
-    # run stage1 to fill partials
-    argmax_kernel.kernel_stage1(vals_f32, partial_vals, partial_idx, n, BLOCK_SIZE=BLOCK_SIZE)
+    # run stage1
+    argmax_kernel.kernel_stage1(vals_for_kernel, partial_vals_wr, partial_idx_wr, n, BLOCK_SIZE=BLOCK_SIZE)
 
-    # run stage2 to reduce partials to single result
-    # allocate single-element outputs on device
-    max_val_t = torch.empty((1,), dtype=torch.float32, device=vals_f32.device)
-    max_idx_t = torch.empty((1,), dtype=torch.int32, device=vals_f32.device)
-    argmax_kernel.kernel_stage2(partial_vals, partial_idx, max_val_t, max_idx_t, num_blocks, BLOCK_SIZE=1024)
+    # allocate outputs on device
+    max_val_dev = Tensor(shape=(1,), dtype=DataType.F32, device=DeviceType.NVIDIA)
+    max_idx_dev = Tensor(shape=(1,), dtype=DataType.I32, device=DeviceType.NVIDIA)
+    max_val_wr = LLAITensorAdapter(max_val_dev.lib_tensor())
+    max_idx_wr = LLAITensorAdapter(max_idx_dev.lib_tensor())
 
-    # write back to llaisys outputs
-    out_val = max_val_t.to(dtype=orig_dtype)
-    from_torch_to_ptr(out_val, max_val_out)
+    # run stage2
+    argmax_kernel.kernel_stage2(partial_vals_wr, partial_idx_wr, max_val_wr, max_idx_wr, num_blocks, BLOCK_SIZE=1024)
 
-    out_idx = max_idx_t.to(dtype=torch.int64)
-    from_torch_to_ptr(out_idx, max_idx_out)
+    # Download results to host and cast to destination dtypes, then write back
+    # helper to read single element from device to host
+    def read_device_scalar(dev_tensor: Tensor, dtype_ll: DataType):
+        elem_size = get_element_size(dtype_ll)
+        host_buf = runtime.malloc_host(elem_size)
+        runtime.memcpy_sync(host_buf, ctypes.c_void_p(LIB_LLAISYS.tensorGetData(dev_tensor.lib_tensor())), elem_size, MemcpyKind.D2H)
+        addr = ctypes.cast(host_buf, ctypes.c_void_p).value
+        if dtype_ll == DataType.F32:
+            v = _np.ctypeslib.as_array((ctypes.c_float * 1).from_address(addr))[0]
+        elif dtype_ll == DataType.I32:
+            v = int(_np.ctypeslib.as_array((ctypes.c_int32 * 1).from_address(addr))[0])
+        else:
+            # fallback read as float32
+            v = _np.ctypeslib.as_array((ctypes.c_float * 1).from_address(addr))[0]
+        runtime.free_host(host_buf)
+        return v
+
+    max_val_f32 = read_device_scalar(max_val_dev, DataType.F32)
+    max_idx_i32 = read_device_scalar(max_idx_dev, DataType.I32)
+
+    # prepare host buffers for writing back to provided outputs
+    # max_val_out: may expect original dtype (F16/F32/BF16)
+    out_val_ptr = _get_raw_ptr(max_val_out)
+    out_val_dt = DataType(LIB_LLAISYS.tensorGetDataType(out_val_ptr))
+    if out_val_dt == DataType.F32:
+        arr_out = _np.array([max_val_f32], dtype=_np.float32)
+    elif out_val_dt == DataType.F16:
+        arr_out = _np.array([max_val_f32], dtype=_np.float16)
+    elif out_val_dt == DataType.BF16:
+        # convert float32 -> bf16 uint16 representation
+        f32bits = _np.frombuffer(_np.array([max_val_f32], dtype=_np.float32).tobytes(), dtype=_np.uint32)
+        bf16 = (_np.uint16(f32bits >> 16))
+        arr_out = bf16
+    else:
+        arr_out = _np.array([max_val_f32], dtype=_np.float32)
+
+    host_buf_out = runtime.malloc_host(arr_out.nbytes)
+    ctypes.memmove(host_buf_out, arr_out.ctypes.data, arr_out.nbytes)
+    LIB_LLAISYS.tensorLoad(out_val_ptr, host_buf_out)
+    runtime.free_host(host_buf_out)
+
+    # max_idx: output may expect i64
+    out_idx_ptr = _get_raw_ptr(max_idx_out)
+    out_idx_dt = DataType(LIB_LLAISYS.tensorGetDataType(out_idx_ptr))
+    if out_idx_dt == DataType.I64:
+        arr_idx = _np.array([int(max_idx_i32)], dtype=_np.int64)
+    elif out_idx_dt == DataType.I32:
+        arr_idx = _np.array([int(max_idx_i32)], dtype=_np.int32)
+    else:
+        arr_idx = _np.array([int(max_idx_i32)], dtype=_np.int64)
+
+    host_buf_idx = runtime.malloc_host(arr_idx.nbytes)
+    ctypes.memmove(host_buf_idx, arr_idx.ctypes.data, arr_idx.nbytes)
+    LIB_LLAISYS.tensorLoad(out_idx_ptr, host_buf_idx)
+    runtime.free_host(host_buf_idx)
 
     return max_idx_out, max_val_out
 
