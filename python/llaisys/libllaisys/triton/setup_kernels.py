@@ -745,45 +745,21 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float, past_k=None, past_
 
 
 def llaisysSwiGLU(out, gate, up):
-    """Launcher for Triton-backed SwiGLU: out = up * gate / (1 + exp(-gate))
-
-    Accepts LLAISYS tensor handles or torch.Tensors. Kernel uses float32
-    for numerical stability and casts back to output dtype.
     """
-    gate_t = to_torch_tensor(gate) if not isinstance(gate, torch.Tensor) else gate
-    up_t = to_torch_tensor(up) if not isinstance(up, torch.Tensor) else up
+    [原创无 Torch 版] Launcher for Triton-backed SwiGLU.
+    """
+    # 1. 将 llaisys.Tensor 包装成 Triton 兼容的对象
+    gate_wrapped = LLAITensorAdapter(gate)
+    up_wrapped = LLAITensorAdapter(up)
+    out_wrapped = LLAITensorAdapter(out)
 
-    # validate shapes and dtypes
-    assert gate_t.shape == up_t.shape, "SwiGLU: gate and up must have same shape"
-
-    # debug: inspect expected destination dtype/shape
-    try:
-        out_ptr = _get_raw_ptr(out)
-        out_dt = DataType(LIB_LLAISYS.tensorGetDataType(out_ptr))
-        out_shape = None
-        ndim = int(LIB_LLAISYS.tensorGetNdim(out_ptr))
-        buf = (ctypes.c_size_t * ndim)()
-        LIB_LLAISYS.tensorGetShape(out_ptr, buf)
-        out_shape = tuple(buf[i] for i in range(ndim))
-        # print(f"[triton.swiGLU] out expected dtype={out_dt} shape={out_shape}")
-    except Exception:
-        pass
-
-    out_t = torch.empty_like(gate_t)
-
-    gate_flat = gate_t.contiguous().view(-1)
-    up_flat = up_t.contiguous().view(-1)
-    out_flat = out_t.contiguous().view(-1)
-
-    # call Triton kernel
-    swiglu_kernel.kernel(gate_flat, up_flat, out_flat, BLOCK=1024)
-
-    # write back
-    try:
-        from_torch_to_ptr(out_t, out)
-    except Exception as e:
-        # print(f"[triton.swiGLU] write-back failed: {e}")
-        raise
+    # 2. 直接将 Wrapper 对象传递给 Triton 内核的启动器
+    swiglu_kernel.kernel(
+        gate_wrapped, 
+        up_wrapped, 
+        out_wrapped, 
+        BLOCK_SIZE=1024
+    )
 
     return out
 
