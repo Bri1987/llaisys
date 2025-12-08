@@ -519,37 +519,36 @@ def llaisysRearrange(out, inp):
 
 
 def llaisysRmsNorm(out, inp, weight, eps: float):
-    """Launcher for Triton-backed RMSNorm: Y = weight * X / sqrt(mean(X**2) + eps)
-
-    Expects `out`, `inp`, `weight` as LLAISYS tensor handles or torch.Tensors.
     """
-    x_t = to_torch_tensor(inp) if not isinstance(inp, torch.Tensor) else inp
-    w_t = to_torch_tensor(weight) if not isinstance(weight, torch.Tensor) else weight
+    [原创无 Torch 版] Launcher for Triton-backed RMSNorm.
+    """
+    # 1. 将 llaisys.Tensor 包装成 Triton 兼容的对象
+    inp_wrapped = LLAITensorAdapter(inp)
+    weight_wrapped = LLAITensorAdapter(weight)
+    out_wrapped = LLAITensorAdapter(out)
 
-    M, D = x_t.shape
+    # 2. 从 wrapper 中获取维度信息
+    M, D = inp_wrapped.shape
 
-    out_t = torch.empty((M, D), dtype=x_t.dtype, device=x_t.device)
-
-    # ensure contiguous flattened storage
-    x_flat = x_t.contiguous()
-    w_flat = w_t.contiguous()
-    out_flat = out_t.contiguous()
-
-    # coerce eps if it's a ctypes.c_float or similar wrapper
+    # 3. 处理 eps (它可能是一个 ctypes 对象)
     try:
-        # handle ctypes simple cdata which expose .value
         if hasattr(eps, "value"):
             eps_val = float(eps.value)
         else:
             eps_val = float(eps)
     except Exception:
         eps_val = float(eps)
-
-    # call Triton kernel
-    rms_norm_kernel.kernel(x_flat, w_flat, out_flat, M, D, eps_val, BLOCK_SIZE=1024)
-
-    # write back
-    from_torch_to_ptr(out_t, out)
+        
+    # 4. 直接将 Wrapper 对象传递给 Triton 内核的启动器
+    rms_norm_kernel.kernel(
+        inp_wrapped, 
+        weight_wrapped, 
+        out_wrapped, 
+        M, 
+        D, 
+        eps_val, 
+        BLOCK_SIZE=1024
+    )
 
     return out
 

@@ -1,62 +1,98 @@
-"""Triton RMSNorm kernel.
+# file: triton/kernels/rms_norm.py
 
-Computes per-row RMS normalization:
-
-    Y_i = W * X_i / sqrt( (1/d) * sum_j X_j^2 + eps )
-
-This module is Triton-only (no PyTorch fallback) so importing it
-requires `triton` to be installed. The kernel is written for clarity
-and correctness first (not heavily optimized)."""
-
-import triton
-import triton.language as tl
-
+try:
+    import triton
+    import triton.language as tl
+except ImportError:
+    triton = None
+    tl = None
 
 @triton.jit
-def _kernel(inp_ptr, weight_ptr, out_ptr, M, D, EPS, BLOCK: tl.constexpr):
-    """Each program instance handles one row and iterates over columns in blocks.
-
-    - `inp_ptr`, `out_ptr` are flattened row-major arrays with shape (M, D).
-    - `weight_ptr` is 1D of length D.
-    - `BLOCK` is a compile-time block size for the inner loop.
+def _kernel(
+    # 接收 Tensor-like 对象
+    Inp_tensor, Weight_tensor, Out_tensor,
+    M, D, 
+    EPS, 
+    BLOCK_SIZE: tl.constexpr
+):
     """
-    row = tl.program_id(0)
+    每个 program instance (线程块) 处理一行。
+    """
+    # 当前处理的行号
+    row_idx = tl.program_id(0)
 
-    # vector of column offsets within a block
-    cols = tl.arange(0, BLOCK)
+    # --- 第一阶段: 计算均方根 (Sum of Squares) ---
+    
+    # 初始化累加器为 float32 或 float64 以保证精度
+    # 对于 RMSNorm，float32 通常足够了
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    
+    # 遍历一行中的所有列 (分块进行)
+    for col_start in range(0, D, BLOCK_SIZE):
+        # 计算当前块的偏移量
+        offsets = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < D
+        
+        # 计算加载地址 (行偏移 + 列偏移)
+        row_offset = row_idx * D
+        inp_ptrs = Inp_tensor + row_offset + offsets
+        
+        # 加载数据
+        inp_vals = tl.load(inp_ptrs, mask=mask, other=0.0)
+        
+        # 计算平方并累加
+        acc += inp_vals * inp_vals
 
-    # accumulator as a length-1 vector of high precision
-    acc = tl.zeros((1,), dtype=tl.float64)
+    # 在块内进行规约，然后得到整个行的总和
+    row_sum_sq = tl.sum(acc, axis=0)
+    
+    # 计算 RMS 分母
+    # var = row_sum_sq / D
+    # rstd = 1.0 / tl.sqrt(var + EPS)
+    # 为了数值稳定性，使用 tl.rsqrt (reciprocal square root)
+    rstd = tl.rsqrt(row_sum_sq / D + EPS)
 
-    # compute base pointer for this row
-    base = row * D
+    # --- 第二阶段: 归一化并写入结果 ---
 
-    # first pass: accumulate sum of squares
-    for off in range(0, D, BLOCK):
-        idx = base + off + cols
-        mask = (off + cols) < D
-        vals = tl.load(inp_ptr + idx, mask=mask, other=0.0).to(tl.float64)
-        # tl.sum returns a scalar; add to length-1 vector to avoid scalar indexing
-        acc += tl.sum(vals * vals)
+    # 再次遍历所有列
+    for col_start in range(0, D, BLOCK_SIZE):
+        offsets = col_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < D
+        
+        # 计算加载/存储地址
+        row_offset = row_idx * D
+        inp_ptrs = Inp_tensor + row_offset + offsets
+        weight_ptrs = Weight_tensor + offsets # weight 是一维的
+        out_ptrs = Out_tensor + row_offset + offsets
 
-    # compute RMS denominator (scalar)
-    denom = tl.sqrt(tl.sum(acc) / D + EPS)
-
-    # second pass: write normalized output
-    for off in range(0, D, BLOCK):
-        idx = base + off + cols
-        mask = (off + cols) < D
-        vals = tl.load(inp_ptr + idx, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(weight_ptr + off + cols, mask=mask, other=0.0).to(tl.float32)
-        out_vals = (vals * w) / denom.to(tl.float32)
-        tl.store(out_ptr + idx, out_vals, mask=mask)
+        # 加载输入和权重
+        inp_vals = tl.load(inp_ptrs, mask=mask, other=0.0)
+        weight_vals = tl.load(weight_ptrs, mask=mask, other=0.0)
+        
+        # 计算最终输出
+        # Y = X * (1 / sqrt(mean(X^2) + eps)) * W
+        out_vals = inp_vals * rstd * weight_vals
+        
+        # 存储结果
+        tl.store(out_ptrs, out_vals, mask=mask)
 
 
 def kernel(inp, weight, out, M, D, eps: float = 1e-5, BLOCK_SIZE: int = 1024):
-    """Wrapper to launch the RMSNorm kernel.
-
-    - `inp`/`out`/`weight` are `torch.Tensor` on CUDA and flattened/contiguous as needed.
-    - `M` is number of rows, `D` is row length.
     """
+    [原创无 Torch 版] 接收 Wrapper 对象的 RMSNorm 启动器。
+    """
+    if triton is None:
+        raise RuntimeError("Triton not found.")
+
+    # Grid 的大小等于行数 M，因为每个 program instance 处理一行
     grid = (M,)
-    _kernel[grid](inp, weight, out, M, D, eps, BLOCK=BLOCK_SIZE)
+
+    # 直接将 wrapper 对象传递给 JIT 内核
+    _kernel[grid](
+        inp,        # LLAITensorAdapter
+        weight,     # LLAITensorAdapter
+        out,        # LLAITensorAdapter
+        M, D, 
+        eps, 
+        BLOCK_SIZE=BLOCK_SIZE
+    )
