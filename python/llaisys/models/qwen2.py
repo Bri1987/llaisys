@@ -454,19 +454,10 @@ class Qwen2:
             v_to_use = v_view
         else:  # Decode stage (seq_len = 1)
             try:
-                tk_past = _sk.to_torch_tensor(past_k)
-                tv_past = _sk.to_torch_tensor(past_v)
-                tk_new = _sk.to_torch_tensor(k_rope)
-                tv_new = _sk.to_torch_tensor(v_view)
-                
-                # 在 seq_len 维度 (dim=0) 上拼接
-                k_cat_torch = _sk.torch.cat([tk_past, tk_new], dim=0)
-                v_cat_torch = _sk.torch.cat([tv_past, tv_new], dim=0)
-                
-                k_to_use = Tensor(shape=k_cat_torch.shape, dtype=past_k.dtype(), device=self.device)
-                v_to_use = Tensor(shape=v_cat_torch.shape, dtype=past_v.dtype(), device=self.device)
-                _sk.from_torch_to_ptr(k_cat_torch, k_to_use)
-                _sk.from_torch_to_ptr(v_cat_torch, v_to_use)
+                # Concatenate KV cache on host/device without using torch.
+                # concat_device_tensors returns a new device Tensor with concatenated seq dimension.
+                k_to_use = _sk.concat_device_tensors(past_k, k_rope)
+                v_to_use = _sk.concat_device_tensors(past_v, v_view)
             except Exception as e:
                 raise RuntimeError(f"Failed to concatenate KV cache at layer {layer_idx} via Triton bridge: {e}")
 
