@@ -642,19 +642,100 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float, past_k=None, past_
     # normalize scale (support ctypes.c_float and other wrappers)
     scale_val = _to_float(scale)
 
-    # best-effort kernel launch (ignore failures)
+    # If no past_k/past_v provided -> prefill path: try to run the simple prefill kernel.
+    # If past_k/past_v provided -> run split/combine decode kernels on device.
     try:
-        def grid(meta):
-            return (triton.cdiv(seq_len_q, meta["BLOCK_SIZE_M"]), num_heads, batch_size)
+        if past_k is None and past_v is None:
+            def grid(meta):
+                return (triton.cdiv(seq_len_q, meta["BLOCK_SIZE_M"]), num_heads, batch_size)
 
-        self_attention_kernel.kernel[grid](
-            q_wr, k_wr, v_wr, o_tmp_wr,
-            *strides_q_b, *strides_k_b, *strides_v_b, *s_o_b,
-            scale_val, seq_len_q, seq_len_k_v,
-            EMB_DIM=emb_dim, BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, IS_CAUSAL=True,
-        )
+            # print("[llaisys] launching Triton prefill self_attention.kernel")
+
+            self_attention_kernel.kernel[grid](
+                q_wr, k_wr, v_wr, o_tmp_wr,
+                *strides_q_b, *strides_k_b, *strides_v_b, *s_o_b,
+                scale_val, seq_len_q, seq_len_k_v,
+                EMB_DIM=emb_dim, BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, IS_CAUSAL=True,
+            )
+        else:
+            # decode path: use split_kv_kernel and combine_kv_splits_kernel
+            # determine num_groups (for GQA support)
+            num_groups = num_heads // num_heads_k
+
+            # prepare past/current wrappers and lengths
+            past_k_wr = LLAITensorAdapter(past_k)
+            past_v_wr = LLAITensorAdapter(past_v)
+            past_seq_len = past_k_wr.shape[0]
+            current_seq_len = k_wr.shape[0]
+            total_seq_len = past_seq_len + current_seq_len
+
+            # choose S heuristic
+            S = get_optimal_s(batch_size, num_heads, total_seq_len, q_wr.device)
+
+            # allocate split buffers on device
+            split_logsumexp = Tensor(shape=(batch_size, num_heads, S, seq_len_q), dtype=DataType.F32, device=DeviceType.NVIDIA, device_id=device_id)
+            split_outputs = Tensor(shape=(batch_size, num_heads, S, seq_len_q, emb_dim), dtype=DataType.F16, device=DeviceType.NVIDIA, device_id=device_id)
+            split_logsumexp_wr = LLAITensorAdapter(split_logsumexp.lib_tensor())
+            split_outputs_wr = LLAITensorAdapter(split_outputs.lib_tensor())
+
+            def grid1(meta):
+                return (triton.cdiv(seq_len_q, meta['BLOCK_SIZE_M']), S, num_heads * batch_size)
+
+            M_binned = triton.next_power_of_2(seq_len_q)
+            N_binned = triton.next_power_of_2(total_seq_len)
+
+            print(f"[llaisys] launching Triton decode split_kv_kernel (S={S}) total_seq_len={total_seq_len} current_seq_len={current_seq_len} past_seq_len={past_seq_len}")
+
+            decode_kernels.split_kv_kernel[grid1](
+                q_wr, k_wr, v_wr, past_k_wr, past_v_wr,
+                scale_val,
+                split_logsumexp_wr, split_outputs_wr,
+                num_heads, num_groups,
+                *strides_q_b,
+                *strides_k_b,
+                *strides_v_b,
+                * (0, past_k_wr.strides[1], past_k_wr.strides[0], past_k_wr.strides[2]),
+                * (0, past_v_wr.strides[1], past_v_wr.strides[0], past_v_wr.strides[2]),
+                split_outputs_wr.strides[0], split_outputs_wr.strides[1], split_outputs_wr.strides[2], split_outputs_wr.strides[3], split_outputs_wr.strides[4],
+                seq_len_q,
+                total_seq_len,
+                current_seq_len,
+                S,
+                EMB_DIM=emb_dim,
+                M_BINNED=M_binned, N_BINNED=N_binned,
+                IS_CAUSAL=True,
+            )
+
+            # always run combine kernel to produce final output
+            final_o = Tensor(shape=(batch_size, num_heads, seq_len_q, emb_dim), dtype=DataType.F16, device=DeviceType.NVIDIA, device_id=device_id)
+            final_l = Tensor(shape=(batch_size, num_heads, seq_len_q), dtype=DataType.F32, device=DeviceType.NVIDIA, device_id=device_id)
+            final_o_wr = LLAITensorAdapter(final_o.lib_tensor())
+            final_l_wr = LLAITensorAdapter(final_l.lib_tensor())
+
+            def grid2(meta):
+                return (triton.cdiv(seq_len_q, meta['BLOCK_SIZE_M']), num_heads, batch_size)
+
+            print(f"[llaisys] launching Triton decode combine_kv_splits_kernel (S={S})")
+
+            decode_kernels.combine_kv_splits_kernel[grid2](
+                split_outputs_wr, split_logsumexp_wr,
+                final_o_wr, final_l_wr,
+                num_heads,
+                split_outputs_wr.strides[0], split_outputs_wr.strides[1], split_outputs_wr.strides[2], split_outputs_wr.strides[3], split_outputs_wr.strides[4],
+                final_o_wr.strides[0], final_o_wr.strides[1], final_o_wr.strides[2], final_o_wr.strides[3],
+                seq_len_q, S,
+                EMB_DIM=emb_dim,
+            )
+
+            # copy final_o -> attn_val_out (D2D)
+            out_dst = _get_raw_ptr(attn_val_out)
+            out_src = _get_raw_ptr(final_o)
+            elem = get_element_size(DataType(LIB_LLAISYS.tensorGetDataType(out_src)))
+            size_bytes = int(batch_size) * int(num_heads) * int(seq_len_q) * int(emb_dim) * int(elem)
+            runtime.memcpy_sync(ctypes.c_void_p(LIB_LLAISYS.tensorGetData(out_dst)), ctypes.c_void_p(LIB_LLAISYS.tensorGetData(out_src)), size_bytes, MemcpyKind.D2D)
+
     except Exception:
-        # kernel autotune/launch failures should not prevent numpy fallback
+        # any Triton/kernel failures should fall back to numpy implementation below
         pass
 
     # --- read device tensors to host numpy arrays ---
