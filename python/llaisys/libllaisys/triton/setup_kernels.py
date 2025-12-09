@@ -194,86 +194,49 @@ def _get_raw_ptr(x):
         return x.lib_tensor()
     return x
 def concat_device_tensors(a, b):
-    """Concatenate two LLAISYS device tensors along the first dimension without using torch.
-
-    Both `a` and `b` are LLAISYS tensor wrappers or raw handles with matching trailing
-    dimensions (e.g., shapes (L1, H, D) and (L2, H, D)). Returns a new device `Tensor`.
     """
-    a_ptr = _get_raw_ptr(a)
-    b_ptr = _get_raw_ptr(b)
-    runtime = RuntimeAPI(DeviceType.NVIDIA)
+    [高效版] 沿第一个维度拼接两个 LLAISYS 设备张量，完全在设备上执行。
+    此版本使用 Device-to-Device (D2D) 内存复制，避免了任何 Host 端的中转。
+    """
+    a_adapter = LLAITensorAdapter(a)
+    b_adapter = LLAITensorAdapter(b)
+    
+    a_shape = a_adapter.shape
+    b_shape = b_adapter.shape
 
-    # read shapes
-    def _shape(p):
-        ndim = int(LIB_LLAISYS.tensorGetNdim(p))
-        buf = (ctypes.c_size_t * ndim)()
-        LIB_LLAISYS.tensorGetShape(p, buf)
-        return tuple(int(buf[i]) for i in range(ndim))
-
-    a_shape = _shape(a_ptr)
-    b_shape = _shape(b_ptr)
+    # --- 1. 验证形状和数据类型 ---
     if len(a_shape) != len(b_shape) or a_shape[1:] != b_shape[1:]:
-        raise RuntimeError("Cannot concat tensors with incompatible shapes: %s vs %s" % (a_shape, b_shape))
+        raise RuntimeError(f"Cannot concat tensors with incompatible shapes: {a_shape} vs {b_shape}")
+    
+    a_dtype = a_adapter._read_dtype_ll()
+    b_dtype = b_adapter._read_dtype_ll()
+    if a_dtype != b_dtype:
+        raise RuntimeError(f"Cannot concat tensors with different dtypes: {a_dtype} vs {b_dtype}")
 
+    # --- 2. 创建输出张量 ---
     out_shape = (a_shape[0] + b_shape[0],) + a_shape[1:]
+    device_id = int(a_adapter.device.split(":")[-1])
+    out_tensor = Tensor(shape=out_shape, dtype=a_dtype, device=DeviceType.NVIDIA, device_id=device_id)
 
-    # dtype and element size
-    dt = DataType(LIB_LLAISYS.tensorGetDataType(a_ptr))
-    elem = get_element_size(dt)
+    # --- 3. 执行 D2D 内存复制 ---
+    runtime = RuntimeAPI(DeviceType.NVIDIA)
+    elem_size = a_adapter.element_size()
+    
+    a_size_bytes = a_adapter.numel() * elem_size
+    b_size_bytes = b_adapter.numel() * elem_size
 
-    # copy both to host
-    a_numel = 1
-    for d in a_shape:
-        a_numel *= int(d)
-    b_numel = 1
-    for d in b_shape:
-        b_numel *= int(d)
+    a_data_ptr = ctypes.c_void_p(a_adapter.data_ptr())
+    b_data_ptr = ctypes.c_void_p(b_adapter.data_ptr())
+    out_data_ptr = ctypes.c_void_p(out_tensor.data_ptr())
 
-    host_a = runtime.malloc_host(a_numel * elem)
-    host_b = runtime.malloc_host(b_numel * elem)
-    runtime.memcpy_sync(host_a, ctypes.c_void_p(LIB_LLAISYS.tensorGetData(a_ptr)), a_numel * elem, MemcpyKind.D2H)
-    runtime.memcpy_sync(host_b, ctypes.c_void_p(LIB_LLAISYS.tensorGetData(b_ptr)), b_numel * elem, MemcpyKind.D2H)
+    # 复制 a 到 out 的开头
+    runtime.memcpy_sync(out_data_ptr, a_data_ptr, a_size_bytes, MemcpyKind.D2D)
 
-    addr_a = ctypes.cast(host_a, ctypes.c_void_p).value
-    addr_b = ctypes.cast(host_b, ctypes.c_void_p).value
-
-    # build numpy views, handle bf16 stored as uint16
-    if dt == DataType.F32:
-        arr_a = _np.ctypeslib.as_array((ctypes.c_float * a_numel).from_address(addr_a)).copy()
-        arr_b = _np.ctypeslib.as_array((ctypes.c_float * b_numel).from_address(addr_b)).copy()
-        concat = _np.concatenate([arr_a, arr_b], axis=0)
-        concat_bytes = concat.astype(_np.float32).tobytes()
-    elif dt == DataType.F16:
-        raw_a = _np.ctypeslib.as_array((ctypes.c_uint16 * a_numel).from_address(addr_a)).copy()
-        raw_b = _np.ctypeslib.as_array((ctypes.c_uint16 * b_numel).from_address(addr_b)).copy()
-        arr_a = raw_a.view(_np.float16)
-        arr_b = raw_b.view(_np.float16)
-        concat = _np.concatenate([arr_a, arr_b], axis=0).astype(_np.float16)
-        concat_bytes = concat.tobytes()
-    elif dt == DataType.BF16:
-        raw_a = _np.ctypeslib.as_array((ctypes.c_uint16 * a_numel).from_address(addr_a)).astype(_np.uint16).copy()
-        raw_b = _np.ctypeslib.as_array((ctypes.c_uint16 * b_numel).from_address(addr_b)).astype(_np.uint16).copy()
-        # convert bf16(uint16) -> f32, concatenate in f32, then convert back to bf16 uint16 for storage
-        f32_a = (raw_a.astype(_np.uint32) << 16).view(_np.float32)
-        f32_b = (raw_b.astype(_np.uint32) << 16).view(_np.float32)
-        concat_f32 = _np.concatenate([f32_a, f32_b], axis=0).astype(_np.float32)
-        f32bits = _np.frombuffer(concat_f32.tobytes(), dtype=_np.uint32)
-        bf16_uint16 = (_np.uint16(f32bits >> 16))
-        concat_bytes = bf16_uint16.tobytes()
-    else:
-        # fallback to raw bytes
-        arr_a = _np.ctypeslib.as_array((ctypes.c_uint8 * (a_numel * elem)).from_address(addr_a)).copy()
-        arr_b = _np.ctypeslib.as_array((ctypes.c_uint8 * (b_numel * elem)).from_address(addr_b)).copy()
-        concat_bytes = _np.concatenate([arr_a, arr_b], axis=0).tobytes()
-
-    # create destination device tensor and load via host staging
-    out_tensor = Tensor(shape=out_shape, dtype=dt, device=DeviceType.NVIDIA)
-    host_buf = runtime.malloc_host(len(concat_bytes))
-    ctypes.memmove(host_buf, concat_bytes, len(concat_bytes))
-    LIB_LLAISYS.tensorLoad(out_tensor.lib_tensor(), host_buf)
-    runtime.free_host(host_buf)
-    runtime.free_host(host_a)
-    runtime.free_host(host_b)
+    # 计算 b 的目标地址（out 的开头 + a 的大小）
+    out_b_offset_ptr = ctypes.c_void_p(out_data_ptr.value + a_size_bytes)
+    
+    # 复制 b 到 out 的偏移位置
+    runtime.memcpy_sync(out_b_offset_ptr, b_data_ptr, b_size_bytes, MemcpyKind.D2D)
 
     return out_tensor
     
@@ -644,19 +607,25 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float, past_k=None, past_
 
     # If no past_k/past_v provided -> prefill path: try to run the simple prefill kernel.
     # If past_k/past_v provided -> run split/combine decode kernels on device.
+    triton_ok = False
     try:
         if past_k is None and past_v is None:
             def grid(meta):
                 return (triton.cdiv(seq_len_q, meta["BLOCK_SIZE_M"]), num_heads, batch_size)
 
-            # print("[llaisys] launching Triton prefill self_attention.kernel")
+            print("[llaisys] launching Triton prefill self_attention.kernel")
 
+            # NOTE: this kernel is autotuned — do not pass BLOCK_SIZE_M/BLOCK_SIZE_N
+            # here as kwargs because they are meta-parameters controlled by the
+            # autotuner and passing them causes a 'Conflicting meta-parameters'
+            # error. Let Triton pick the best config.
             self_attention_kernel.kernel[grid](
                 q_wr, k_wr, v_wr, o_tmp_wr,
                 *strides_q_b, *strides_k_b, *strides_v_b, *s_o_b,
                 scale_val, seq_len_q, seq_len_k_v,
-                EMB_DIM=emb_dim, BLOCK_SIZE_M=32, BLOCK_SIZE_N=32, IS_CAUSAL=True,
+                EMB_DIM=emb_dim, IS_CAUSAL=True,
             )
+            triton_ok = True
         else:
             # decode path: use split_kv_kernel and combine_kv_splits_kernel
             # determine num_groups (for GQA support)
@@ -733,10 +702,22 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float, past_k=None, past_
             elem = get_element_size(DataType(LIB_LLAISYS.tensorGetDataType(out_src)))
             size_bytes = int(batch_size) * int(num_heads) * int(seq_len_q) * int(emb_dim) * int(elem)
             runtime.memcpy_sync(ctypes.c_void_p(LIB_LLAISYS.tensorGetData(out_dst)), ctypes.c_void_p(LIB_LLAISYS.tensorGetData(out_src)), size_bytes, MemcpyKind.D2D)
+            triton_ok = True
 
-    except Exception:
+    except Exception as e:
         # any Triton/kernel failures should fall back to numpy implementation below
-        pass
+        try:
+            import traceback
+
+            print(f"[llaisys] Triton kernels raised exception: {e}")
+            traceback.print_exc()
+        except Exception:
+            # ignore printing errors
+            pass
+        triton_ok = False
+
+    if not triton_ok:
+        print("[llaisys] Triton path failed or not used — falling back to numpy implementation for self-attention")
 
     # --- read device tensors to host numpy arrays ---
     def _read_dev_to_numpy(tensor_like):

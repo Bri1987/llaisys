@@ -43,6 +43,7 @@ def kernel(
 	batch_head_offset_o = batch_index * o_stride_z + head_index * o_stride_h
     
 	q_start = query_tile_index * BLOCK_SIZE_M
+	m_offsets = q_start + tl.arange(0, BLOCK_SIZE_M) # 【新增】为 Causal Mask 准备 m_offsets
     
 	q_block_ptr = tl.make_block_ptr(
 		base=q_ptr + batch_head_offset_q,
@@ -65,7 +66,7 @@ def kernel(
 	v_block_ptr = tl.make_block_ptr(
 		base=v_ptr + batch_head_offset_v,
 		shape=(seq_len_k_v, EMB_DIM),
-		strides=(v_stride_k, v_stride_n),
+		strides=(v_stride_k, v_stride_n), # 注意 v 的 strides 是 (行主序)
 		offsets=(0, 0),
 		block_shape=(BLOCK_SIZE_N, EMB_DIM),
 		order=(1, 0),
@@ -82,40 +83,37 @@ def kernel(
     
 	q = tl.load(q_block_ptr, boundary_check=(0, 1))
     
-	# 初始化累加器
 	acc = tl.zeros((BLOCK_SIZE_M, EMB_DIM), dtype=tl.float32)
 	l_i = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
 	m_i = tl.full((BLOCK_SIZE_M,), float("-inf"), dtype=tl.float32)
     
+	# 当 seq_len_k_v > seq_len_q 时，意味着有 past_kv
 	offset = seq_len_k_v - seq_len_q
 	for i in range(0, tl.cdiv(seq_len_k_v, BLOCK_SIZE_N)):
 		k = tl.load(k_block_ptr, boundary_check=(0, 1))
 		v = tl.load(v_block_ptr, boundary_check=(0, 1))
         
-		# 计算 QK^T 并应用 scale 因子
 		n_offsets = i * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
 		mask = n_offsets < seq_len_k_v
 		qk = tl.dot(q, k)
+
 		if IS_CAUSAL:
 			causal_mask = (m_offsets[:, None] + offset) >= n_offsets[None, :]
-			qk = tl.where(mask[None, :].to(tl.bool) & causal_mask, qk, float("-inf"))
+			# 【修正】直接使用 mask 和 causal_mask，不再调用 .to(tl.bool)
+			# `&` 运算符会正确地组合两个掩码
+			combined_mask = mask[None, :] & causal_mask
+			qk = tl.where(combined_mask, qk, float("-inf"))
 		else:
-			qk = tl.where(mask[None, :].to(tl.bool), qk, float("-inf"))
+			# 【修正】直接使用 mask，不再调用 .to(tl.bool)
+			qk = tl.where(mask[None, :], qk, float("-inf"))
+		
+		# ---- 后续的 Online Softmax 部分保持不变 ----
 		s_ij = qk * scale
-        
-		# 结合历史最大值 m_i，寻找当前块的新最大值 m_ij
 		m_ij = tl.maximum(m_i, tl.max(s_ij, 1))
-        
-		# 计算缩放后的 softmax 概率 p
 		p = tl.math.exp2((s_ij - m_ij[:, None]) * log2e)
-        
-		# 计算用于更新旧累加器的缩放因子 alpha
 		alpha = tl.math.exp2((m_i - m_ij) * log2e)
-        
-		# 更新累加器 acc 和归一化因子 l_i
 		acc = acc * alpha[:, None]
 		acc += tl.dot(p.to(v.dtype), v)
-        
 		l_ij = tl.sum(p, 1)
 		l_i = l_i * alpha + l_ij
 		m_i = m_ij
@@ -125,7 +123,7 @@ def kernel(
 
 	acc = acc / l_i[:, None]
 	tl.store(o_block_ptr, acc.to(o_ptr.type.element_ty), boundary_check=(0, 1))
-
+ 
 
 @triton.autotune(
 	configs=tuple(
