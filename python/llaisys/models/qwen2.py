@@ -172,6 +172,11 @@ class Qwen2:
         # Set to False to let Python manage concatenation instead.
         # self.kv_append_via_kernel = True
 
+        # per-layer scratch tensors to avoid repeated allocations during
+        # per-token / per-layer forward calls. Each entry is a dict
+        # mapping a short name -> Tensor instance that will be reused.
+        self.layer_scratch = [dict() for _ in range(num_layers)]
+
 
     def _log_tensor(self, name: str, t: Tensor, topk: int = 5):
         """Best-effort logging for a LLAISYS `Tensor`.
@@ -199,6 +204,41 @@ class Qwen2:
         except Exception:
             # never crash due to logging
             pass
+
+    def _get_scratch(self, layer_idx: int, name: str, shape, dtype):
+        """Get or allocate a reusable scratch Tensor for `layer_idx`.
+
+        - `shape` may be a tuple of ints or a Tensor-style shape()
+        - `dtype` is passed to `Tensor` constructor (usually a DataType)
+        """
+        # normalize shape to tuple of ints
+        try:
+            shp = tuple(int(s) for s in shape)
+        except Exception:
+            try:
+                shp = tuple(int(s) for s in shape())
+            except Exception:
+                shp = tuple(shape)
+
+        cache = self.layer_scratch[layer_idx].get(name)
+        if cache is not None:
+            try:
+                # cache.shape may be method or attribute
+                existing = None
+                if callable(getattr(cache, 'shape', None)):
+                    existing = cache.shape()
+                else:
+                    existing = getattr(cache, 'shape', None)
+                if existing is not None:
+                    existing_tup = tuple(int(s) for s in existing)
+                    if existing_tup == shp:
+                        return cache
+            except Exception:
+                pass
+
+        t = Tensor(shape=shp, dtype=dtype, device=self.device)
+        self.layer_scratch[layer_idx][name] = t
+        return t
 
     def validate_parameters(self, verbose: bool = False):
         """检查并返回已加载参数的摘要。
@@ -390,19 +430,25 @@ class Qwen2:
 
             if step < max_new_tokens - 1:
                 current_pos = prompt_len + step
-                pos_id_np = _np.asarray([current_pos], dtype=_np.int64)
-                pos_id_tensor = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
-                pos_id_tensor.load(c_void_p(pos_id_np.ctypes.data))
+                # reuse small numpy buffers and device tensors for single-token steps
+                if step == 0:
+                    # preallocate small host buffers and device tensors for reuse
+                    self._decode_pos_np = _np.zeros((1,), dtype=_np.int64)
+                    self._decode_pos_tensor = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
+                    self._decode_token_np = _np.zeros((1,), dtype=_np.int64)
+                    self._decode_token_tensor = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
 
-                new_token_id_np = _np.asarray([new_token_id], dtype=_np.int64)
-                new_token_tensor = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
-                new_token_tensor.load(c_void_p(new_token_id_np.ctypes.data))
+                self._decode_pos_np[0] = current_pos
+                self._decode_pos_tensor.load(c_void_p(self._decode_pos_np.ctypes.data))
 
-                x = Tensor(shape=(1, d_model), dtype=self.embed_weight.dtype(), device=self.device)
-                Ops.embedding(x, new_token_tensor, self.embed_weight)
+                self._decode_token_np[0] = new_token_id
+                self._decode_token_tensor.load(c_void_p(self._decode_token_np.ctypes.data))
+
+                x = self._get_scratch(0, "embedding_temp", (1, d_model), self.embed_weight.dtype())
+                Ops.embedding(x, self._decode_token_tensor, self.embed_weight)
 
                 for i in range(len(self.layers)):
-                    x = self._block_forward(x, i, pos_id_tensor)
+                    x = self._block_forward(x, i, self._decode_pos_tensor)
                 
                 next_token_input = x
 
@@ -423,11 +469,11 @@ class Qwen2:
         normed = Tensor(shape=(seq_len, d_model), dtype=x.dtype(), device=self.device)
         Ops.rms_norm(normed, x, ln1_w, eps)
 
-        q = Tensor(shape=(seq_len, d_model), dtype=normed.dtype(), device=self.device)
+        q = self._get_scratch(layer_idx, "q", (seq_len, d_model), normed.dtype())
         Ops.linear(q, normed, layer.get("q_w"), layer.get("q_b"))
-        k = Tensor(shape=(seq_len, layer.get("k_w").shape()[0]), dtype=normed.dtype(), device=self.device)
+        k = self._get_scratch(layer_idx, "k", (seq_len, layer.get("k_w").shape()[0]), normed.dtype())
         Ops.linear(k, normed, layer.get("k_w"), layer.get("k_b"))
-        v = Tensor(shape=(seq_len, layer.get("v_w").shape()[0]), dtype=normed.dtype(), device=self.device)
+        v = self._get_scratch(layer_idx, "v", (seq_len, layer.get("v_w").shape()[0]), normed.dtype())
         Ops.linear(v, normed, layer.get("v_w"), layer.get("v_b"))
 
         # Reshape and RoPE
@@ -439,8 +485,8 @@ class Qwen2:
         k_view = k.view(seq_len, kv_heads, head_dim)
         v_view = v.view(seq_len, kv_heads, head_dim)
 
-        q_rope = Tensor(shape=q_view.shape(), dtype=q_view.dtype(), device=self.device)
-        k_rope = Tensor(shape=k_view.shape(), dtype=k_view.dtype(), device=self.device)
+        q_rope = self._get_scratch(layer_idx, "q_rope", q_view.shape(), q_view.dtype())
+        k_rope = self._get_scratch(layer_idx, "k_rope", k_view.shape(), k_view.dtype())
         theta = float(self.config.get("rope_theta", 10000.0))
         Ops.rope(q_rope, q_view, pos_ids, theta)
         Ops.rope(k_rope, k_view, pos_ids, theta)
@@ -466,35 +512,35 @@ class Qwen2:
         self.kv_cache[layer_idx]["v"] = v_to_use
 
         # Self-Attention
-        attn_out = Tensor(shape=q_rope.shape(), dtype=q_rope.dtype(), device=self.device)
+        attn_out = self._get_scratch(layer_idx, "attn_out", q_rope.shape(), q_rope.dtype())
         scale = 1.0 / math.sqrt(max(1, head_dim))
         # 总是传入完整的 K/V
         Ops.self_attention(attn_out, q_rope, k_to_use, v_to_use, scale)
 
         # --- 后续 MLP 和残差连接部分保持不变 ---
         attn_flat = attn_out.view(seq_len, d_model)
-        o = Tensor(shape=(seq_len, d_model), dtype=attn_flat.dtype(), device=self.device)
+        o = self._get_scratch(layer_idx, "o", (seq_len, d_model), attn_flat.dtype())
         Ops.linear(o, attn_flat, layer.get("o_w"), layer.get("o_b"))
 
-        res = Tensor(shape=(seq_len, d_model), dtype=o.dtype(), device=self.device)
+        res = self._get_scratch(layer_idx, "res", (seq_len, d_model), o.dtype())
         Ops.add(res, x, o)
 
         ln2_w = layer.get("ln2")
-        norm2 = Tensor(shape=(seq_len, d_model), dtype=res.dtype(), device=self.device)
+        norm2 = self._get_scratch(layer_idx, "norm2", (seq_len, d_model), res.dtype())
         Ops.rms_norm(norm2, res, ln2_w, eps)
 
-        gate = Tensor(shape=(seq_len, layer.get("mlp_gate_w").shape()[0]), dtype=norm2.dtype(), device=self.device)
+        gate = self._get_scratch(layer_idx, "gate", (seq_len, layer.get("mlp_gate_w").shape()[0]), norm2.dtype())
         Ops.linear(gate, norm2, layer.get("mlp_gate_w"), None)
-        up = Tensor(shape=(seq_len, layer.get("mlp_up_w").shape()[0]), dtype=norm2.dtype(), device=self.device)
+        up = self._get_scratch(layer_idx, "up", (seq_len, layer.get("mlp_up_w").shape()[0]), norm2.dtype())
         Ops.linear(up, norm2, layer.get("mlp_up_w"), None)
 
-        out_mlp = Tensor(shape=(seq_len, layer.get("mlp_gate_w").shape()[0]), dtype=gate.dtype(), device=self.device)
+        out_mlp = self._get_scratch(layer_idx, "out_mlp", (seq_len, layer.get("mlp_gate_w").shape()[0]), gate.dtype())
         Ops.swiglu(out_mlp, gate, up)
 
-        down = Tensor(shape=(seq_len, d_model), dtype=out_mlp.dtype(), device=self.device)
+        down = self._get_scratch(layer_idx, "down", (seq_len, d_model), out_mlp.dtype())
         Ops.linear(down, out_mlp, layer.get("mlp_down_w"), None)
 
-        new_x = Tensor(shape=(seq_len, d_model), dtype=down.dtype(), device=self.device)
+        new_x = self._get_scratch(layer_idx, "new_x", (seq_len, d_model), down.dtype())
         Ops.add(new_x, res, down)
 
         return new_x
