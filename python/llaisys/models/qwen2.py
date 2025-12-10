@@ -503,82 +503,80 @@ class Qwen2:
 
     def _block_forward(self, x: Tensor, layer_idx: int, pos_ids: Tensor) -> Tensor:
         """
-        Performs a forward pass for a single transformer block.
-        It now explicitly concatenates the KV cache for the decode stage.
+        [Ultra-Optimized] In-Place K Update & Zero-Copy V Update.
+        Eliminates 'k_temp' scratch buffer entirely.
         """
         layer = self.layers[layer_idx]
         seq_len = x.shape()[0]
         d_model = x.shape()[1]
 
-        # RMSNorm 1 & Projections
+        # 1. RMSNorm
         ln1_w = layer.get("ln1")
         eps = float(self.config.get("rms_norm_eps", 1e-6))
         normed = Tensor(shape=(seq_len, d_model), dtype=x.dtype(), device=self.device)
         Ops.rms_norm(normed, x, ln1_w, eps)
 
-        q = self._get_scratch(layer_idx, "q", (seq_len, d_model), normed.dtype())
-        Ops.linear(q, normed, layer.get("q_w"), layer.get("q_b"))
-        k = self._get_scratch(layer_idx, "k", (seq_len, layer.get("k_w").shape()[0]), normed.dtype())
-        Ops.linear(k, normed, layer.get("k_w"), layer.get("k_b"))
-        v = self._get_scratch(layer_idx, "v", (seq_len, layer.get("v_w").shape()[0]), normed.dtype())
-        Ops.linear(v, normed, layer.get("v_w"), layer.get("v_b"))
-
-        # Reshape and RoPE
+        # 2. 准备 KV Cache 的写入位置 (Views)
+        cache_k = self.kv_cache[layer_idx].get("k")
+        cache_v = self.kv_cache[layer_idx].get("v")
+        start_pos = int(self.kv_cache[layer_idx].get("len", 0))
+        
         num_heads = self.config.get("num_attention_heads")
         kv_heads = self.config.get("num_key_value_heads")
         head_dim = d_model // num_heads
 
+        if cache_k is not None:
+            # 获取 Cache 的切片引用
+            k_dest = cache_k.slice(0, start_pos, start_pos + seq_len)
+            v_dest = cache_v.slice(0, start_pos, start_pos + seq_len)
+        else:
+            k_dest = self._get_scratch(layer_idx, "k_dest", (seq_len, kv_heads, head_dim), normed.dtype())
+            v_dest = self._get_scratch(layer_idx, "v_dest", (seq_len, kv_heads, head_dim), normed.dtype())
+
+        # 3. 计算 Q (Q 还是需要 Scratch，因为它不是 Cache 的一部分)
+        q = self._get_scratch(layer_idx, "q", (seq_len, d_model), normed.dtype())
+        Ops.linear(q, normed, layer.get("q_w"), layer.get("q_b"))
+
+        # 4. 计算 V -> 【直接写入 Cache】 (保持之前的优化)
+        # 依赖 Ops.linear 的新逻辑处理 3D Strides
+        Ops.linear(v_dest, normed, layer.get("v_w"), layer.get("v_b"))
+
+        # 5. 计算 K -> 【直接写入 Cache (RAW K)】
+        # 优化点：不再写入 k_temp，而是直接把未旋转的 K 写入 Cache
+        Ops.linear(k_dest, normed, layer.get("k_w"), layer.get("k_b"))
+
+        # 6. RoPE
         q_view = q.view(seq_len, num_heads, head_dim)
-        k_view = k.view(seq_len, kv_heads, head_dim)
-        v_view = v.view(seq_len, kv_heads, head_dim)
+        # k_dest 已经是 (Seq, KV_Heads, Head_Dim) 形状，无需 view
 
         q_rope = self._get_scratch(layer_idx, "q_rope", q_view.shape(), q_view.dtype())
-        k_rope = self._get_scratch(layer_idx, "k_rope", k_view.shape(), k_view.dtype())
         theta = float(self.config.get("rope_theta", 10000.0))
-        Ops.rope(q_rope, q_view, pos_ids, theta)
-        Ops.rope(k_rope, k_view, pos_ids, theta)
         
-        # --- 【核心修正】显式的 KV Cache 管理 (in-place) ---
-        cache_k = self.kv_cache[layer_idx].get("k")
-        cache_v = self.kv_cache[layer_idx].get("v")
-        cache_len = int(self.kv_cache[layer_idx].get("len", 0))
+        # Q 的 RoPE (Out-of-place: q -> q_rope)
+        Ops.rope(q_rope, q_view, pos_ids, theta)
+        
+        # K 的 RoPE -> 【In-Place 原地旋转】
+        # 输入和输出都是 k_dest。Triton Kernel 读取 Cache 中的值，旋转后写回 Cache。
+        # 这一步极其高效，没有额外的显存分配和搬运。
+        Ops.rope(k_dest, k_dest, pos_ids, theta)
 
-        if cache_k is None:
-            # no cache allocated, fall back to existing behavior
-            k_to_use = k_rope
-            v_to_use = v_view
-            # set cache len to seq_len if desired
-        else:
-            # Prefill: cache exists but empty -> write at offset 0
-            if cache_len == 0:
-                try:
-                    _sk.kv_cache_write_slice(cache_k, k_rope, 0)
-                    _sk.kv_cache_write_slice(cache_v, v_view, 0)
-                except Exception as e:
-                    raise RuntimeError(f"KV cache write failed at prefill for layer {layer_idx}: {e}")
-                new_len = cache_len + seq_len
-                self.kv_cache[layer_idx]["len"] = new_len
-                k_to_use = cache_k.slice(0, 0, new_len)
-                v_to_use = cache_v.slice(0, 0, new_len)
-            else:
-                # Decode stage: append new kv at current cache_len
-                try:
-                    _sk.kv_cache_write_slice(cache_k, k_rope, cache_len)
-                    _sk.kv_cache_write_slice(cache_v, v_view, cache_len)
-                except Exception as e:
-                    raise RuntimeError(f"KV cache append failed at decode for layer {layer_idx}: {e}")
-                new_len = cache_len + seq_len
-                self.kv_cache[layer_idx]["len"] = new_len
-                k_to_use = cache_k.slice(0, 0, new_len)
-                v_to_use = cache_v.slice(0, 0, new_len)
+        # 7. 准备 Attention 参数
+        past_k = None
+        past_v = None
 
-        # Self-Attention
+        if cache_k is not None:
+            self.kv_cache[layer_idx]["len"] = start_pos + seq_len
+            if start_pos > 0:
+                past_k = cache_k.slice(0, 0, start_pos)
+                past_v = cache_v.slice(0, 0, start_pos)
+        
+        # 8. Self-Attention
         attn_out = self._get_scratch(layer_idx, "attn_out", q_rope.shape(), q_rope.dtype())
         scale = 1.0 / math.sqrt(max(1, head_dim))
-        # 总是传入完整的 K/V
-        Ops.self_attention(attn_out, q_rope, k_to_use, v_to_use, scale)
+        
+        Ops.self_attention(attn_out, q_rope, k_dest, v_dest, scale, past_k, past_v)
 
-        # --- 后续 MLP 和残差连接部分保持不变 ---
+        # --- MLP 部分 (保持不变) ---
         attn_flat = attn_out.view(seq_len, d_model)
         o = self._get_scratch(layer_idx, "o", (seq_len, d_model), attn_flat.dtype())
         Ops.linear(o, attn_flat, layer.get("o_w"), layer.get("o_b"))

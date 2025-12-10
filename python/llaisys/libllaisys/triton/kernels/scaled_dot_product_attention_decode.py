@@ -66,18 +66,15 @@ def split_kv_kernel(
     q = tl.load(q_block_ptr, boundary_check=(0,))
 
     # --- 循环 1: 处理 Past K/V ---
-    # 计算此 Kernel 实例需要处理的 Past KV 范围
     past_seq_len = seq_len_k_v - current_seq_len
     past_loop_start = left
     past_loop_end = tl.minimum(right, past_seq_len)
     
-    # 只有当处理范围内确实包含 Past KV 时，才执行此循环
     if past_loop_start < past_loop_end:
         past_k_ptr_base = past_k_ptr + off_z * past_k_stride_z + off_hk * past_k_stride_h
         past_v_ptr_base = past_v_ptr + off_z * past_v_stride_z + off_hk * past_v_stride_h
         
         for n_block_start in range(past_loop_start, past_loop_end, BLOCK_SIZE_N):
-            # 为当前块创建指针
             past_k_block_ptr = tl.make_block_ptr(
                 base=past_k_ptr_base, shape=(EMB_DIM, past_seq_len), strides=(past_k_stride_k, past_k_stride_n),
                 offsets=(0, n_block_start), block_shape=(EMB_DIM, BLOCK_SIZE_N), order=(0, 1)
@@ -91,19 +88,26 @@ def split_kv_kernel(
             v = tl.load(past_v_block_ptr, boundary_check=(0,))
             
             qk_scores = tl.dot(q, k)
-            # 在处理 Past KV 时，不应用因果掩码, 因为历史的 key/value 对当前的 query 都是可见的。
+            
+            # 【修复开始】: 显式 Mask 掉 Past KV 中超出实际长度的填充部分
+            # make_block_ptr 会把越界的部分填 0，导致 exp(0)=1，干扰 Softmax。
+            # 必须将这些位置设为 -inf。
+            cur_n_indices = n_block_start + tl.arange(0, BLOCK_SIZE_N)
+            # 只要索引小于 past_seq_len 就是有效的
+            boundary_mask = cur_n_indices[None, :] < past_seq_len
+            qk_scores = tl.where(boundary_mask, qk_scores, float("-inf"))
+            # 【修复结束】
             
             # 在线Softmax更新
             new_max_score = tl.maximum(max_log_score, tl.max(qk_scores, 1))
             rescale_factor = tl.math.exp2((max_log_score - new_max_score) * qk_scale)
             softmax_probs = tl.math.exp2(qk_scores * qk_scale - new_max_score[:, None] * qk_scale)
             output_accumulator *= rescale_factor[:, None]
-            output_accumulator += tl.dot(softmax_probs.to(tl.float16), v)
+            output_accumulator += tl.dot(softmax_probs.to(tl.float16), v.to(tl.float16))
             sum_exp_score = sum_exp_score * rescale_factor + tl.sum(softmax_probs, 1)
             max_log_score = new_max_score
 
     # --- 循环 2: 处理 Current K/V ---
-    # 计算此 Kernel 实例需要处理的 Current KV 范围
     current_loop_start = tl.maximum(left, past_seq_len)
     current_loop_end = right
 
@@ -112,7 +116,6 @@ def split_kv_kernel(
         v_ptr_base = v_ptr + off_z * v_stride_z + off_hk * v_stride_h
         
         for n_block_start in range(current_loop_start, current_loop_end, BLOCK_SIZE_N):
-            # 偏移量需要减去 past_seq_len，以匹配 Current K/V 张量的索引
             k_offset = n_block_start - past_seq_len
             
             k_block_ptr = tl.make_block_ptr(
@@ -129,26 +132,33 @@ def split_kv_kernel(
 
             qk_scores = tl.dot(q, k)
             
-            # 在处理 Current KV 时，必须应用因果掩码
             if IS_CAUSAL:
-                # n_offsets 是在完整序列长度(seq_len_k_v)坐标系下的
                 n_offsets = n_block_start + tl.arange(0, BLOCK_SIZE_N)
-                # m_offsets 是在当前查询(seq_len_q)坐标系下的，也需要转换到完整序列坐标系
                 causal_mask = (m_offsets[:, None] + past_seq_len) >= n_offsets[None, :]
                 qk_scores = tl.where(causal_mask, qk_scores, float("-inf"))
+                # Current KV Loop 通常不需要额外的 boundary_mask，因为 Causal Mask 
+                # (m + past >= n) 在 n > total_seq 时会自动 Mask 掉越界部分
+                # (前提是 total_seq 也就是 current token 是序列的最后一个)
 
             new_max_score = tl.maximum(max_log_score, tl.max(qk_scores, 1))
             rescale_factor = tl.math.exp2((max_log_score - new_max_score) * qk_scale)
             softmax_probs = tl.math.exp2(qk_scores * qk_scale - new_max_score[:, None] * qk_scale)
             output_accumulator *= rescale_factor[:, None]
-            output_accumulator += tl.dot(softmax_probs.to(tl.float16), v)
+            output_accumulator += tl.dot(softmax_probs.to(tl.float16), v.to(tl.float16))
             sum_exp_score = sum_exp_score * rescale_factor + tl.sum(softmax_probs, 1)
             max_log_score = new_max_score
 
-    # 后处理和存储
-    inverse_l_i = 1.0 / sum_exp_score
-    final_output = output_accumulator * inverse_l_i[:, None]
     final_logsumexp = max_log_score * scale + tl.log(sum_exp_score)
+
+    # 修复 S>1 时的 NaN 问题：
+    # 当 sum_exp_score 为 0 时 (此 Split 为空)，inverse_l_i 为 Inf。
+    # 0.0 * Inf = NaN。我们需要强制让它为 0.0。
+    final_output = tl.where(
+        sum_exp_score[:, None] > 0.0, 
+        output_accumulator * (1.0 / sum_exp_score[:, None]), 
+        0.0
+    )
+    # -------------------------------------------------------------------------
     
     if IS_CAUSAL and seq_len_q > seq_len_k_v:
         empty_row_mask = (m_offsets + past_seq_len) < 0
