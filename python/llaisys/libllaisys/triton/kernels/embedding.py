@@ -1,5 +1,3 @@
-# file: triton/kernels/embedding.py
-
 try:
     import triton
     import triton.language as tl
@@ -9,62 +7,81 @@ except ImportError:
 
 @triton.jit
 def _kernel(
-    # 接收 Tensor-like 对象
-    Index_tensor, Weight_tensor, Out_tensor,
-    N, D, 
-    TOTAL_ELEMENTS, 
+    Index_ptr,    # 输入索引张量指针
+    Weight_ptr,   # 权重表指针 [VocabSize, D]
+    Out_ptr,      # 输出张量指针 [N, D]
+    D,            # Embedding 维度
+    # Meta-parameters
     BLOCK_SIZE: tl.constexpr
 ):
     """
-    [原创无 Torch 版]
-    每个 program instance 处理输出张量中的一个数据块。
-    """
-    # 当前 program instance 处理的全局偏移量 (在扁平化的输出张量中)
-    pid = tl.program_id(0)
-    global_offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = global_offsets < TOTAL_ELEMENTS
-
-    # --- 从全局偏移量计算出 2D 的 (row, col) 坐标 ---
-    # row 对应要查询的第几个词 (0 to N-1)
-    # col 对应 embedding 的维度 (0 to D-1)
-    row_indices = global_offsets // D
-    col_indices = global_offsets % D
+    [优化版] 2D Tiling Embedding Kernel
     
-    # --- 加载需要查询的 token ID ---
-    # 使用 row_indices (去重后) 从 Index_tensor 加载
-    # 注意: 这里的加载有冗余，因为同一个 row_idx 会被加载多次
-    # 但这是最简单的实现方式
-    token_ids = tl.load(Index_tensor + row_indices, mask=mask)
-
-    # --- 计算源地址 (在 weight tensor 中) ---
-    # 地址 = token_id * D + col_idx
-    src_offsets = token_ids * D + col_indices
-
-    # 从 weight tensor 中加载 embedding 数据
-    embedding_vals = tl.load(Weight_tensor + src_offsets, mask=mask, other=0.0)
-
-    # --- 将结果写入输出张量 ---
-    # 输出张量的地址就是我们一开始的全局偏移量
-    tl.store(Out_tensor + global_offsets, embedding_vals, mask=mask)
-
-
-def kernel(index, weight, out, N, D, BLOCK_SIZE: int = 1024):
+    Grid 布局:
+      program_id(0): 处理 Embedding 维度方向的分块 (cols)
+      program_id(1): 处理 Batch/Seq 维度的索引 (rows)
     """
-    [原创无 Torch 版] 接收 Wrapper 对象的 Embedding 启动器。
+    # 1. 确定当前负责的 Token 行号 (row index)
+    pid_row = tl.program_id(1)
+    
+    # 2. 确定当前负责的 Embedding 维度分块 (col offset)
+    pid_col = tl.program_id(0)
+    col_offsets = pid_col * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    
+    # 3. 加载 Token ID
+    # 关键优化：每个 Block 只需要加载一次 Scalar 索引，而不是每个元素加载一次
+    # Index_ptr 指向 [N]，直接加上 row 偏移
+    idx_ptr = Index_ptr + pid_row
+    token_id = tl.load(idx_ptr)
+    
+    # 4. 计算权重和输出的内存地址
+    # 假设 Weight 是 Row-Major [Vocab, D]
+    # 地址 = (token_id * D) + col_offsets
+    w_ptr = Weight_ptr + (token_id * D) + col_offsets
+    
+    # 输出地址 = (row_index * D) + col_offsets
+    o_ptr = Out_ptr + (pid_row * D) + col_offsets
+    
+    # 5. 边界检查掩码 (处理 D 不是 BLOCK_SIZE 倍数的情况)
+    mask = col_offsets < D
+    
+    # 6. 向量化加载和存储
+    # 关键优化：Triton 会自动将其编译为向量指令 (如 ld.global.v4.f32)
+    val = tl.load(w_ptr, mask=mask, other=0.0)
+    tl.store(o_ptr, val, mask=mask)
+
+
+def kernel(index, weight, out, N, D, BLOCK_SIZE: int = None):
+    """
+    [优化版] Embedding 启动器
     """
     if triton is None:
         raise RuntimeError("Triton not found.")
 
-    # 总共要计算的元素数量
-    total_elements = N * D
-    grid = (triton.cdiv(total_elements, BLOCK_SIZE),)
+    # 自动选择合适的 Block Size
+    # Embedding 维度通常是 2 的幂 (e.g. 1024, 4096)，或者很大
+    # 我们希望 Block Size 尽可能大以利用带宽，但不能超过 D 太多导致浪费
+    if BLOCK_SIZE is None:
+        if D >= 1024:
+            BLOCK_SIZE = 1024
+        elif D >= 512:
+            BLOCK_SIZE = 512
+        elif D >= 256:
+            BLOCK_SIZE = 256
+        else:
+            # 向上取整到最近的 2 的幂
+            BLOCK_SIZE = triton.next_power_of_2(D)
 
-    # 直接将 wrapper 对象传递给 JIT 内核
+    # Grid 维度计算
+    # X 轴: 覆盖 Embedding 维度 D (所需 block 数量)
+    # Y 轴: 覆盖 Batch * SeqLen 维度 N
+    grid = (triton.cdiv(D, BLOCK_SIZE), N)
+
+    # 启动 Kernel
     _kernel[grid](
-        index,       # LLAITensorAdapter
+        index,       # LLAITensorAdapter (Triton 会调用 .data_ptr())
         weight,      # LLAITensorAdapter
         out,         # LLAITensorAdapter
-        N, D,
-        total_elements,
+        D,
         BLOCK_SIZE=BLOCK_SIZE
     )
