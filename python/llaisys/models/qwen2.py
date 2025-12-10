@@ -408,6 +408,20 @@ class Qwen2:
             x = Tensor(shape=(prompt_len, d_model), dtype=self.embed_weight.dtype(), device=self.device)
             Ops.embedding(x, prompt_ids, self.embed_weight)
 
+            # Prepare per-layer KV caches for decode: allocate capacity = prompt_len + max_new_tokens
+            total_capacity = prompt_len + max_new_tokens
+            num_heads = self.config.get("num_attention_heads")
+            kv_heads = self.config.get("num_key_value_heads") or num_heads
+            head_dim = d_model // num_heads
+            for li in range(len(self.layers)):
+                # if not already allocated, create k/v cache tensors
+                if self.kv_cache[li].get('k') is None:
+                    k_cache = Tensor(shape=(total_capacity, kv_heads, head_dim), dtype=self.layers[li]['k_w'].dtype(), device=self.device)
+                    v_cache = Tensor(shape=(total_capacity, kv_heads, head_dim), dtype=self.layers[li]['v_w'].dtype(), device=self.device)
+                    self.kv_cache[li]['k'] = k_cache
+                    self.kv_cache[li]['v'] = v_cache
+                    self.kv_cache[li]['len'] = 0
+
             for i in range(len(self.layers)):
                 x = self._block_forward(x, i, pos_ids)
         else: # 处理空 prompt 的情况
@@ -524,25 +538,39 @@ class Qwen2:
         Ops.rope(q_rope, q_view, pos_ids, theta)
         Ops.rope(k_rope, k_view, pos_ids, theta)
         
-        # --- 【核心修正】显式的 KV Cache 管理 ---
-        past_k = self.kv_cache[layer_idx].get("k")
-        past_v = self.kv_cache[layer_idx].get("v")
+        # --- 【核心修正】显式的 KV Cache 管理 (in-place) ---
+        cache_k = self.kv_cache[layer_idx].get("k")
+        cache_v = self.kv_cache[layer_idx].get("v")
+        cache_len = int(self.kv_cache[layer_idx].get("len", 0))
 
-        if past_k is None:  # Prefill stage (seq_len > 1)
+        if cache_k is None:
+            # no cache allocated, fall back to existing behavior
             k_to_use = k_rope
             v_to_use = v_view
-        else:  # Decode stage (seq_len = 1)
-            try:
-                # Concatenate KV cache on host/device without using torch.
-                # concat_device_tensors returns a new device Tensor with concatenated seq dimension.
-                k_to_use = _sk.concat_device_tensors(past_k, k_rope)
-                v_to_use = _sk.concat_device_tensors(past_v, v_view)
-            except Exception as e:
-                raise RuntimeError(f"Failed to concatenate KV cache at layer {layer_idx} via Triton bridge: {e}")
-
-        # 更新缓存为拼接后的完整 K/V
-        self.kv_cache[layer_idx]["k"] = k_to_use
-        self.kv_cache[layer_idx]["v"] = v_to_use
+            # set cache len to seq_len if desired
+        else:
+            # Prefill: cache exists but empty -> write at offset 0
+            if cache_len == 0:
+                try:
+                    _sk.kv_cache_write_slice(cache_k, k_rope, 0)
+                    _sk.kv_cache_write_slice(cache_v, v_view, 0)
+                except Exception as e:
+                    raise RuntimeError(f"KV cache write failed at prefill for layer {layer_idx}: {e}")
+                new_len = cache_len + seq_len
+                self.kv_cache[layer_idx]["len"] = new_len
+                k_to_use = cache_k.slice(0, 0, new_len)
+                v_to_use = cache_v.slice(0, 0, new_len)
+            else:
+                # Decode stage: append new kv at current cache_len
+                try:
+                    _sk.kv_cache_write_slice(cache_k, k_rope, cache_len)
+                    _sk.kv_cache_write_slice(cache_v, v_view, cache_len)
+                except Exception as e:
+                    raise RuntimeError(f"KV cache append failed at decode for layer {layer_idx}: {e}")
+                new_len = cache_len + seq_len
+                self.kv_cache[layer_idx]["len"] = new_len
+                k_to_use = cache_k.slice(0, 0, new_len)
+                v_to_use = cache_v.slice(0, 0, new_len)
 
         # Self-Attention
         attn_out = self._get_scratch(layer_idx, "attn_out", q_rope.shape(), q_rope.dtype())

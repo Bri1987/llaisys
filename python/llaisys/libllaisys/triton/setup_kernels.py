@@ -200,62 +200,54 @@ def _get_raw_ptr(x):
     if hasattr(x, "lib_tensor"):
         return x.lib_tensor()
     return x
-def concat_device_tensors(a, b):
+
+def create_kv_cache(total_seq_len: int, kv_heads: int, head_dim: int, dtype: DataType, device_type: DeviceType, device_id: int = 0) -> Tensor:
+    """Create an empty KV cache tensor on the specified device.
+
+    Returns a Tensor of shape (total_seq_len, kv_heads, head_dim).
     """
-    [高效版] 沿第一个维度拼接两个 LLAISYS 设备张量，完全在设备上执行。
-    此版本使用 Device-to-Device (D2D) 内存复制，避免了任何 Host 端的中转。
+    shape = (total_seq_len, kv_heads, head_dim)
+    return Tensor(shape=shape, dtype=dtype, device=device_type, device_id=device_id)
+
+
+def kv_cache_write_slice(cache: Tensor, src: Tensor, dst_offset: int):
+    """Write `src` into `cache` at sequence offset `dst_offset` along dim 0.
+
+    Performs a device-to-device memcpy. `src` shape is (S, kv_heads, head_dim).
     """
-    a_adapter = LLAITensorAdapter(a)
-    b_adapter = LLAITensorAdapter(b)
-    
-    a_shape = a_adapter.shape
-    b_shape = b_adapter.shape
+    cache_wr = LLAITensorAdapter(cache)
+    src_wr = LLAITensorAdapter(src)
 
-    # --- 1. 验证形状和数据类型 ---
-    if len(a_shape) != len(b_shape) or a_shape[1:] != b_shape[1:]:
-        raise RuntimeError(f"Cannot concat tensors with incompatible shapes: {a_shape} vs {b_shape}")
-    
-    a_dtype = a_adapter._read_dtype_ll()
-    b_dtype = b_adapter._read_dtype_ll()
-    if a_dtype != b_dtype:
-        raise RuntimeError(f"Cannot concat tensors with different dtypes: {a_dtype} vs {b_dtype}")
-
-    # --- 2. 创建输出张量 ---
-    out_shape = (a_shape[0] + b_shape[0],) + a_shape[1:]
-    # infer device type/id from input tensor to avoid hardcoding NVIDIA
-    in_ptr = _get_raw_ptr(a)
+    # infer device and runtime from cache
     try:
-        device_type = DeviceType(LIB_LLAISYS.tensorGetDeviceType(in_ptr))
+        in_ptr = _get_raw_ptr(cache)
+        dev_type = DeviceType(LIB_LLAISYS.tensorGetDeviceType(in_ptr))
     except Exception:
-        device_type = DeviceType.NVIDIA
-    try:
-        device_id = int(LIB_LLAISYS.tensorGetDeviceId(in_ptr))
-    except Exception:
-        device_id = 0
+        dev_type = DeviceType.NVIDIA
 
-    out_tensor = Tensor(shape=out_shape, dtype=a_dtype, device=device_type, device_id=device_id)
+    runtime = RuntimeAPI(dev_type)
 
-    # --- 3. 执行 D2D 内存复制 ---
-    runtime = RuntimeAPI(device_type)
-    elem_size = a_adapter.element_size()
-    
-    a_size_bytes = a_adapter.numel() * elem_size
-    b_size_bytes = b_adapter.numel() * elem_size
+    # compute bytes
+    elem_size = cache_wr.element_size()
+    # row_elems = number of elements per sequence step (kv_heads * head_dim)
+    seq_dim = src_wr.shape[0]
+    if isinstance(seq_dim, tuple) or seq_dim is None:
+        seq_dim = int(src_wr.shape[0])
+    row_elems = 1
+    for s in src_wr.shape[1:]:
+        row_elems *= int(s)
 
-    a_data_ptr = ctypes.c_void_p(a_adapter.data_ptr())
-    b_data_ptr = ctypes.c_void_p(b_adapter.data_ptr())
-    out_data_ptr = ctypes.c_void_p(out_tensor.data_ptr())
+    src_bytes = src_wr.numel() * elem_size
+    offset_bytes = dst_offset * row_elems * elem_size
 
-    # 复制 a 到 out 的开头
-    runtime.memcpy_sync(out_data_ptr, a_data_ptr, a_size_bytes, MemcpyKind.D2D)
+    dst_ptr = ctypes.c_void_p(cache_wr.data_ptr())
+    src_ptr = ctypes.c_void_p(src_wr.data_ptr())
 
-    # 计算 b 的目标地址（out 的开头 + a 的大小）
-    out_b_offset_ptr = ctypes.c_void_p(out_data_ptr.value + a_size_bytes)
-    
-    # 复制 b 到 out 的偏移位置
-    runtime.memcpy_sync(out_b_offset_ptr, b_data_ptr, b_size_bytes, MemcpyKind.D2D)
+    dst_offset_ptr = ctypes.c_void_p(dst_ptr.value + offset_bytes)
 
-    return out_tensor
+    runtime.memcpy_sync(dst_offset_ptr, src_ptr, src_bytes, MemcpyKind.D2D)
+
+    return
     
     
 def llaisysAdd(out, a, b):
