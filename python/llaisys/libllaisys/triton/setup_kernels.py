@@ -439,88 +439,68 @@ def llaisysEmbedding(out, index, weight):
 
 
 def llaisysLinear(out, inp, weight, bias):
-    """Launcher for Triton-backed linear: Y = X W^T + b
-
-    Converts inputs to torch tensors, launches Triton matmul kernel, writes back.
     """
-    # Torch-free implementation: use LLAISYS device tensors and adapters.
-    # Keep the original logic/semantics (M,N,K, output dtype flags) but avoid creating torch tensors.
-    # Wrap inputs
+    [正确性优先版] Triton Linear Launcher
+    - 不使用 Autotune
+    - 使用固定的 Block Size (64, 64, 32)
+    - 使用 tl.dot 保证数学运算正确且不溢出
+    - 直接写入 out，不进行中间拷贝
+    """
+    # 1. 包装输入
     x_wr = LLAITensorAdapter(inp)
     w_wr = LLAITensorAdapter(weight)
+    out_wr = LLAITensorAdapter(out)
 
-    # Validate 2D
+    # 2. 形状检查
     if len(x_wr.shape) != 2 or len(w_wr.shape) != 2:
-        raise RuntimeError(f"Triton linear expects 2D tensors: got x.shape={x_wr.shape} w.shape={w_wr.shape}")
+        raise RuntimeError(f"Triton linear expects 2D tensors")
 
     M, K = x_wr.shape
     N = w_wr.shape[0]
 
-    # determine device id from input tensor
-    in_ptr = _get_raw_ptr(inp)
-    device_id = int(LIB_LLAISYS.tensorGetDeviceId(in_ptr))
-
-    # determine output dtype from weight (keep previous behavior: out dtype == weight dtype)
-    w_ptr = _get_raw_ptr(weight)
-    w_dtype = DataType(LIB_LLAISYS.tensorGetDataType(w_ptr))
-
-    # create temporary output device tensor with same dtype as weight
-    out_tmp = Tensor(shape=(M, N), dtype=w_dtype, device=DeviceType.NVIDIA, device_id=device_id)
-    out_wr = LLAITensorAdapter(out_tmp.lib_tensor())
-
-    # prepare bias tensor
-    runtime = RuntimeAPI(DeviceType.NVIDIA)
+    # 3. 处理 Bias
+    b_wr = None
     if bias is not None:
         b_wr = LLAITensorAdapter(bias)
-    else:
-        # create N zeros float32 bias (matching previous implementation behavior)
-        zeros = _np.zeros((N,), dtype=_np.float32)
-        host_buf = runtime.malloc_host(zeros.nbytes)
-        ctypes.memmove(host_buf, zeros.ctypes.data, zeros.nbytes)
-        b_tmp = Tensor(shape=(N,), dtype=DataType.F32, device=DeviceType.NVIDIA, device_id=device_id)
-        LIB_LLAISYS.tensorLoad(b_tmp.lib_tensor(), host_buf)
-        runtime.free_host(host_buf)
-        b_wr = LLAITensorAdapter(b_tmp.lib_tensor())
 
-    # determine OUT_FP flags
+    # 4. 获取 Strides (关键：处理非连续内存)
+    stride_xm, stride_xk = x_wr.strides
+    stride_wn, stride_wk = w_wr.strides
+    stride_om, stride_on = out_wr.strides
+
+    # 5. 确定输出精度
+    # 简单的 heuristic: 如果权重是 FP32，输出保持 FP32。否则依赖 store 自动降级。
+    w_dtype = w_wr._read_dtype_ll()
     OUT_FP32 = (w_dtype == DataType.F32)
-    OUT_FP16 = (w_dtype == DataType.F16)
-    OUT_BF16 = (w_dtype == DataType.BF16)
 
-    # grid sizes (match previous tiling)
-    grid_m = (M + 32 - 1) // 32
-    grid_n = (N + 32 - 1) // 32
+    # 6. 设置固定的 Block Size
+    # 这些值比较保守且通用，适合验证正确性
+    BLOCK_M = 64
+    BLOCK_N = 64
+    BLOCK_K = 32
 
-    # Launch kernel using adapters (no torch tensors)
-    linear_kernel._kernel[(grid_m, grid_n)](
-        x_wr,
-        w_wr,
-        out_wr,
-        b_wr,
-        M,
-        N,
-        K,
-        BLOCK_M=32,
-        BLOCK_N=32,
-        BLOCK_K=16,
-        OUT_FP32=OUT_FP32,
-        OUT_FP16=OUT_FP16,
-        OUT_BF16=OUT_BF16,
+    # 7. 计算 Grid
+    grid_m = triton.cdiv(M, BLOCK_M)
+    grid_n = triton.cdiv(N, BLOCK_N)
+    grid = (grid_m, grid_n)
+
+    # 8. 启动 Kernel
+    linear_kernel._kernel[grid](
+        x_wr,           # X 指针
+        w_wr,           # W 指针
+        b_wr,           # Bias 指针
+        out_wr,         # Out 指针
+        M, N, K,        # 维度
+        stride_xm, stride_xk, # X Strides
+        stride_wn, stride_wk, # W Strides
+        stride_om, stride_on, # Out Strides
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        OUT_FP32=OUT_FP32
     )
 
-    # copy result device->device into user-provided `out` tensor
-    out_ptr = _get_raw_ptr(out)
-    out_tmp_data = LIB_LLAISYS.tensorGetData(out_tmp.lib_tensor())
-    out_dst_data = LIB_LLAISYS.tensorGetData(out_ptr)
-    elem_size = get_element_size(w_dtype)
-    size_bytes = int(M) * int(N) * int(elem_size)
-    try:
-        runtime.memcpy_sync(ctypes.c_void_p(out_dst_data), ctypes.c_void_p(out_tmp_data), size_bytes, MemcpyKind.D2D)
-    except Exception as e:
-        raise RuntimeError(f"D2D memcpy failed when writing linear output: {e}") from e
-
     return out
-
 
 def llaisysRmsNorm(out, inp, weight, eps: float):
     """

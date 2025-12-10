@@ -1,90 +1,89 @@
-"""Triton linear kernel: computes Y = X @ W^T + b.
-
-This module uses Triton only (no PyTorch fallback). Import will fail
-with ImportError if Triton is not installed.
-"""
-
 import triton
 import triton.language as tl
 
-
 @triton.jit
 def _kernel(
-    A, B, C, D, M, N, K,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    # 指针
+    X_ptr, W_ptr, Bias_ptr, Out_ptr,
+    # 形状
+    M, N, K,
+    # Strides (步长)
+    stride_xm, stride_xk,
+    stride_wn, stride_wk,
+    stride_om, stride_on,
+    # Block 参数 (这里作为参数传入，不再是 Autotune)
+    BLOCK_M: tl.constexpr, 
+    BLOCK_N: tl.constexpr, 
     BLOCK_K: tl.constexpr,
-    OUT_FP32: tl.constexpr = True,
-    OUT_FP16: tl.constexpr = False,
-    OUT_BF16: tl.constexpr = False,
+    # 精度控制
+    OUT_FP32: tl.constexpr,
 ):
+    # --- 1. Grid 坐标计算 ---
+    # 最简单的 2D Grid 映射，不使用 swizzle
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
 
-    m_start = pid_m * BLOCK_M
-    n_start = pid_n * BLOCK_N
+    # 计算当前 Block 在 M 和 N 方向的起始偏移量
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
 
-    # Blocked, vectorized implementation:
-    # - load blocks of A: shape (BLOCK_M, BLOCK_K)
-    # - load blocks of B: shape (BLOCK_N, BLOCK_K)
-    # - accumulate C_block (BLOCK_M, BLOCK_N) via vectorized outer-products
-    m_off = m_start + tl.arange(0, BLOCK_M)
-    n_off = n_start + tl.arange(0, BLOCK_N)
+    # --- 2. 指针计算 ---
+    # 计算 X 和 W 的基础指针位置
+    # X 形状 [M, K], 我们取 [BLOCK_M, BLOCK_K] 的块
+    # W 形状 [N, K], 我们取 [BLOCK_N, BLOCK_K] 的块
+    x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+    w_ptrs = W_ptr + (offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    # --- 3. 矩阵乘法主循环 ---
+    # 初始化累加器为 fp32 (保证精度)
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    k = 0
-    while k < K:
-        k_offs = tl.arange(0, BLOCK_K) + k
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        # 处理 K 维度边界 (当 K 不是 BLOCK_K 倍数时)
+        current_k_len = K - k * BLOCK_K
+        k_mask = offs_k < current_k_len
 
-        # pointers for block loads
-        a_ptr = A + (m_off[:, None] * K + k_offs[None, :])
-        b_ptr = B + (n_off[:, None] * K + k_offs[None, :])
+        # 加载 X Block: 检查 M 边界和 K 边界
+        # other=0.0 非常重要，保证 padding 部分不影响加法
+        mask_m = offs_m[:, None] < M
+        x = tl.load(x_ptrs, mask=mask_m & k_mask[None, :], other=0.0)
 
-        # masks for partial tiles
-        a_mask = (m_off[:, None] < M) & (k_offs[None, :] < K)
-        b_mask = (n_off[:, None] < N) & (k_offs[None, :] < K)
+        # 加载 W Block: 检查 N 边界和 K 边界
+        mask_n = offs_n[:, None] < N
+        w = tl.load(w_ptrs, mask=mask_n & k_mask[None, :], other=0.0)
 
-        a = tl.load(a_ptr, mask=a_mask, other=0.0).to(tl.float32)
-        b = tl.load(b_ptr, mask=b_mask, other=0.0).to(tl.float32)
+        # 计算点积: accumulator += x @ w.T
+        # W 加载出来是 [BLOCK_N, BLOCK_K], 转置后是 [BLOCK_K, BLOCK_N]
+        # X [BLOCK_M, BLOCK_K] @ W^T [BLOCK_K, BLOCK_N] -> [BLOCK_M, BLOCK_N]
+        accumulator += tl.dot(x, tl.trans(w), allow_tf32=True)
 
-        # vectorized accumulation: sum over k of a[:, :, None] * b[None, :, :]
-        acc += tl.sum(a[:, None, :] * b[None, :, :], axis=2)
+        # 指针步进到下一个 K 块
+        x_ptrs += BLOCK_K * stride_xk
+        w_ptrs += BLOCK_K * stride_wk
 
-        k += BLOCK_K
+    # --- 4. 后处理 (Bias & Store) ---
+    
+    # 加载 Bias (如果存在)
+    if Bias_ptr is not None:
+        bias_ptrs = Bias_ptr + offs_n
+        bias_mask = offs_n < N
+        bias = tl.load(bias_ptrs, mask=bias_mask, other=0.0).to(tl.float32)
+        accumulator += bias[None, :]
 
-    # bias: load for n indices and add (broadcast over m dimension)
-    bias = tl.load(D + n_off, mask=(n_off < N), other=0.0).to(tl.float32)
-    out_block = acc + bias[None, :]
-
-    # cast results to the output buffer dtype (fixes buffer-size mismatch bug)
+    # 结果类型转换
+    # 始终让 Triton 的 store 来处理最终的 dtype cast
+    c = accumulator
     if OUT_FP32:
-        out_block = out_block.to(tl.float32)
-    elif OUT_FP16:
-        out_block = out_block.to(tl.float16)
-    elif OUT_BF16:
-        out_block = out_block.to(tl.bfloat16)
-    else:
-        # default to float32 if nothing specified
-        out_block = out_block.to(tl.float32)
+        c = c.to(tl.float32)
+    # else: 保持 float32，store 到 f16/bf16 指针时 Triton 自动转换
 
-    # store block
-    c_ptr = C + (m_off[:, None] * N + n_off[None, :])
-    store_mask = (m_off[:, None] < M) & (n_off[None, :] < N)
-    tl.store(c_ptr, out_block, mask=store_mask)
-
-
-def kernel(x, w, b, M, N, K, BLOCK_M=64, BLOCK_N=64, BLOCK_K=32):
-    # wrapper: compute grid and launch
-    grid = ((M + BLOCK_M - 1) // BLOCK_M, (N + BLOCK_N - 1) // BLOCK_N)
-    _kernel[grid](
-        x,
-        w,
-        b if b is not None else tl.constexpr(0),
-        M,
-        N,
-        K,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
+    # 计算输出指针并写入
+    # Out 形状 [M, N]
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    out_ptrs = Out_ptr + (stride_om * offs_m[:, None] + stride_on * offs_n[None, :])
+    out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    
+    tl.store(out_ptrs, c, mask=out_mask)
