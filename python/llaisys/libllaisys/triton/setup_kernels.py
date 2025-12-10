@@ -39,6 +39,11 @@ def get_element_size(llaisys_dtype):
     }
     return dtype_map.get(llaisys_dtype, 4) # 默认为 4 字节 (float32)
 
+
+# Lightweight cache for RoPE precomputed buffers per (device_type, device_id, seq_len, half)
+# Stores dict with keys: 'sin', 'cos' (device Tensors), 'host_stage_bytes' (int), 'host_stage_ptr' (ctypes pointer)
+_rope_cache = {}
+
 class LLAITensorAdapter:
     """Compact adapter for LLAISYS tensors that exposes the small API
         Triton expects.
@@ -217,11 +222,21 @@ def concat_device_tensors(a, b):
 
     # --- 2. 创建输出张量 ---
     out_shape = (a_shape[0] + b_shape[0],) + a_shape[1:]
-    device_id = int(a_adapter.device.split(":")[-1])
-    out_tensor = Tensor(shape=out_shape, dtype=a_dtype, device=DeviceType.NVIDIA, device_id=device_id)
+    # infer device type/id from input tensor to avoid hardcoding NVIDIA
+    in_ptr = _get_raw_ptr(a)
+    try:
+        device_type = DeviceType(LIB_LLAISYS.tensorGetDeviceType(in_ptr))
+    except Exception:
+        device_type = DeviceType.NVIDIA
+    try:
+        device_id = int(LIB_LLAISYS.tensorGetDeviceId(in_ptr))
+    except Exception:
+        device_id = 0
+
+    out_tensor = Tensor(shape=out_shape, dtype=a_dtype, device=device_type, device_id=device_id)
 
     # --- 3. 执行 D2D 内存复制 ---
-    runtime = RuntimeAPI(DeviceType.NVIDIA)
+    runtime = RuntimeAPI(device_type)
     elem_size = a_adapter.element_size()
     
     a_size_bytes = a_adapter.numel() * elem_size
@@ -742,7 +757,18 @@ def llaisysROPE(out, inp, pos_ids, theta: float):
     except Exception:
         theta_val = float(theta)
 
-    runtime = RuntimeAPI(DeviceType.NVIDIA)
+    # infer device from input and obtain runtime for that device
+    in_ptr = _get_raw_ptr(inp)
+    try:
+        device_type = DeviceType(LIB_LLAISYS.tensorGetDeviceType(in_ptr))
+    except Exception:
+        device_type = DeviceType.NVIDIA
+    try:
+        device_id = int(LIB_LLAISYS.tensorGetDeviceId(in_ptr))
+    except Exception:
+        device_id = 0
+
+    runtime = RuntimeAPI(device_type)
 
     # --- read pos_ids to host (use float64 for high precision) ---
     pos_ptr = _get_raw_ptr(pos_ids)
@@ -755,13 +781,34 @@ def llaisysROPE(out, inp, pos_ids, theta: float):
 
     src_pos_dt = DataType(LIB_LLAISYS.tensorGetDataType(pos_ptr))
     src_elem = get_element_size(src_pos_dt)
-    host_pos_buf = runtime.malloc_host(pos_numel * src_elem)
-    runtime.memcpy_sync(host_pos_buf, ctypes.c_void_p(LIB_LLAISYS.tensorGetData(pos_ptr)), pos_numel * src_elem, MemcpyKind.D2H)
+
+    # reuse or allocate host staging buffer for pos_ids
+    host_pos_bytes = pos_numel * src_elem
+    cache_key = (int(device_type), device_id, pos_numel)
+    cached = _rope_cache.get(cache_key)
+    if cached and cached.get('host_pos_bytes') == host_pos_bytes and cached.get('host_pos_buf') is not None:
+        host_pos_buf = cached['host_pos_buf']
+    else:
+        host_pos_buf = runtime.malloc_host(host_pos_bytes)
+        if not cached:
+            _rope_cache[cache_key] = {}
+        _rope_cache[cache_key]['host_pos_buf'] = host_pos_buf
+        _rope_cache[cache_key]['host_pos_bytes'] = host_pos_bytes
+
+    runtime.memcpy_sync(host_pos_buf, ctypes.c_void_p(LIB_LLAISYS.tensorGetData(pos_ptr)), host_pos_bytes, MemcpyKind.D2H)
     host_pos_addr = ctypes.cast(host_pos_buf, ctypes.c_void_p).value
     if src_pos_dt == DataType.I64:
-        pos_host = _np.ctypeslib.as_array((ctypes.c_int64 * pos_numel).from_address(host_pos_addr)).astype(_np.float64)
+        pos_host_raw = _np.ctypeslib.as_array((ctypes.c_int64 * pos_numel).from_address(host_pos_addr))
     else:
-        pos_host = _np.ctypeslib.as_array((ctypes.c_int32 * pos_numel).from_address(host_pos_addr)).astype(_np.float64)
+        pos_host_raw = _np.ctypeslib.as_array((ctypes.c_int32 * pos_numel).from_address(host_pos_addr))
+    pos_host = pos_host_raw.astype(_np.float64)
+
+    # detect common case where pos_ids == arange(seq_len)
+    try:
+        pos_int = pos_host_raw.astype(_np.int64)
+        is_arange = _np.array_equal(pos_int, _np.arange(seq_len, dtype=_np.int64))
+    except Exception:
+        is_arange = False
 
     # --- compute freqs matrix and sin/cos on host in float64 for higher precision ---
     indices = _np.arange(0, half, dtype=_np.float64)
@@ -773,23 +820,66 @@ def llaisysROPE(out, inp, pos_ids, theta: float):
     sin_host = _np.sin(freqs_mat).astype(_np.float32)
     cos_host = _np.cos(freqs_mat).astype(_np.float32)
 
-    # flatten and upload sin and cos as temporary device tensors of shape (seq_len*half,)
+    # flatten and upload sin and cos as device tensors; reuse if cached
     flat_len = sin_host.size
     sin_flat = sin_host.ravel()
     cos_flat = cos_host.ravel()
 
-    sin_ptr = Tensor(shape=(flat_len,), dtype=DataType.F32, device=DeviceType.NVIDIA)
-    cos_ptr = Tensor(shape=(flat_len,), dtype=DataType.F32, device=DeviceType.NVIDIA)
-    # load data via host staging
-    host_buf_sin = runtime.malloc_host(sin_flat.nbytes)
-    ctypes.memmove(host_buf_sin, sin_flat.ctypes.data, sin_flat.nbytes)
-    LIB_LLAISYS.tensorLoad(sin_ptr.lib_tensor(), host_buf_sin)
-    runtime.free_host(host_buf_sin)
+    if is_arange:
+        sin_cos_key = (int(device_type), device_id, seq_len, half)
+        cached2 = _rope_cache.get(sin_cos_key)
+        if cached2 and cached2.get('sin') is not None and cached2.get('cos') is not None:
+            sin_ptr = cached2['sin']
+            cos_ptr = cached2['cos']
+        else:
+            sin_ptr = Tensor(shape=(flat_len,), dtype=DataType.F32, device=device_type, device_id=device_id)
+            cos_ptr = Tensor(shape=(flat_len,), dtype=DataType.F32, device=device_type, device_id=device_id)
 
-    host_buf_cos = runtime.malloc_host(cos_flat.nbytes)
-    ctypes.memmove(host_buf_cos, cos_flat.ctypes.data, cos_flat.nbytes)
-    LIB_LLAISYS.tensorLoad(cos_ptr.lib_tensor(), host_buf_cos)
-    runtime.free_host(host_buf_cos)
+            # use (or create) a host staging buffer for sin/cos loads
+            host_stage_bytes = max(sin_flat.nbytes, cos_flat.nbytes)
+            if cached2 is None:
+                cached2 = {}
+                _rope_cache[sin_cos_key] = cached2
+            if cached2.get('host_stage_bytes') == host_stage_bytes and cached2.get('host_stage_buf') is not None:
+                host_stage_buf = cached2['host_stage_buf']
+            else:
+                # allocate host staging buffer once
+                host_stage_buf = runtime.malloc_host(host_stage_bytes)
+                cached2['host_stage_buf'] = host_stage_buf
+                cached2['host_stage_bytes'] = host_stage_bytes
+
+            # copy sin
+            ctypes.memmove(host_stage_buf, sin_flat.ctypes.data, sin_flat.nbytes)
+            LIB_LLAISYS.tensorLoad(sin_ptr.lib_tensor(), host_stage_buf)
+
+            # copy cos
+            ctypes.memmove(host_stage_buf, cos_flat.ctypes.data, cos_flat.nbytes)
+            LIB_LLAISYS.tensorLoad(cos_ptr.lib_tensor(), host_stage_buf)
+
+            cached2['sin'] = sin_ptr
+            cached2['cos'] = cos_ptr
+    else:
+        # non-standard pos_ids; compute sin/cos and upload but don't cache values
+        sin_ptr = Tensor(shape=(flat_len,), dtype=DataType.F32, device=device_type, device_id=device_id)
+        cos_ptr = Tensor(shape=(flat_len,), dtype=DataType.F32, device=device_type, device_id=device_id)
+        # try to reuse a per-device host staging buffer if present
+        stage_key = ('rope_stage', int(device_type), device_id)
+        stage_cached = _rope_cache.get(stage_key)
+        host_stage_bytes = max(sin_flat.nbytes, cos_flat.nbytes)
+        if stage_cached and stage_cached.get('host_stage_bytes') == host_stage_bytes and stage_cached.get('host_stage_buf') is not None:
+            host_stage_buf = stage_cached['host_stage_buf']
+        else:
+            host_stage_buf = runtime.malloc_host(host_stage_bytes)
+            if stage_cached is None:
+                stage_cached = {}
+                _rope_cache[stage_key] = stage_cached
+            stage_cached['host_stage_buf'] = host_stage_buf
+            stage_cached['host_stage_bytes'] = host_stage_bytes
+
+        ctypes.memmove(host_stage_buf, sin_flat.ctypes.data, sin_flat.nbytes)
+        LIB_LLAISYS.tensorLoad(sin_ptr.lib_tensor(), host_stage_buf)
+        ctypes.memmove(host_stage_buf, cos_flat.ctypes.data, cos_flat.nbytes)
+        LIB_LLAISYS.tensorLoad(cos_ptr.lib_tensor(), host_stage_buf)
 
     sin_wr = LLAITensorAdapter(sin_ptr.lib_tensor())
     cos_wr = LLAITensorAdapter(cos_ptr.lib_tensor())
@@ -803,8 +893,8 @@ def llaisysROPE(out, inp, pos_ids, theta: float):
         BLOCK=128,
     )
 
-    # destroy temporary host pos buffer
-    runtime.free_host(host_pos_buf)
+    # Note: host_pos_buf and host staging buffers are cached in _rope_cache
+    # and intentionally not freed here to avoid repeated malloc/free.
 
     return out
 

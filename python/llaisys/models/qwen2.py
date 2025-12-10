@@ -178,6 +178,14 @@ class Qwen2:
         # mapping a short name -> Tensor instance that will be reused.
         self.layer_scratch = [dict() for _ in range(num_layers)]
 
+        # Reusable tensors for decode: lazily initialized to avoid
+        # allocating per-token logits/argmax outputs every step.
+        self._reusable_logits = None
+        self._reusable_argmax_idx = None
+        self._reusable_argmax_val = None
+        # Cached lm_head bias (if model didn't provide one)
+        self._cached_lm_head_bias = None
+
 
     def _log_tensor(self, name: str, t: Tensor, topk: int = 5):
         """Best-effort logging for a LLAISYS `Tensor`.
@@ -364,19 +372,24 @@ class Qwen2:
 
         # --- [FIX 1] 预先准备好 lm_head_bias ---
         # 确保传递给 Ops.linear 的 bias 永远是一个有效的 Tensor，而不是 None
-        bias_t = self.lm_head_bias
-        if bias_t is None:
-            target_dtype = self.lm_head_weight.dtype()
-            bias_t = Tensor(shape=(vocab_size,), dtype=target_dtype, device=self.device)
-            # 创建一个全零的 numpy 数组并加载进去
-            if target_dtype == DataType.BF16 and ml_dtypes:
-                np_dtype = ml_dtypes.bfloat16
-            elif target_dtype == DataType.F16:
-                np_dtype = _np.float16
-            else: # 默认为 F32
-                np_dtype = _np.float32
-            zero_np = _np.zeros((vocab_size,), dtype=np_dtype)
-            bias_t.load(c_void_p(zero_np.ctypes.data))
+        # Prefer a cached bias tensor if the model did not provide one.
+        if self.lm_head_bias is not None:
+            bias_t = self.lm_head_bias
+        else:
+            if self._cached_lm_head_bias is None:
+                target_dtype = self.lm_head_weight.dtype()
+                bt = Tensor(shape=(vocab_size,), dtype=target_dtype, device=self.device)
+                # create zero numpy buffer with matching dtype
+                if target_dtype == DataType.BF16 and ml_dtypes:
+                    np_dtype = ml_dtypes.bfloat16
+                elif target_dtype == DataType.F16:
+                    np_dtype = _np.float16
+                else:
+                    np_dtype = _np.float32
+                zero_np = _np.zeros((vocab_size,), dtype=np_dtype)
+                bt.load(c_void_p(zero_np.ctypes.data))
+                self._cached_lm_head_bias = bt
+            bias_t = self._cached_lm_head_bias
 
 
         # --- 1. PREFILL STAGE ---
@@ -412,20 +425,32 @@ class Qwen2:
         for step in range(max_new_tokens):
             final_hidden_state = next_token_input
 
-            logits = Tensor(shape=(1, vocab_size), dtype=self.lm_head_weight.dtype(), device=self.device)
-            Ops.linear(logits, final_hidden_state, self.lm_head_weight, bias_t) # 现在 bias_t 永远有效
+            # reuse or lazily allocate logits and argmax output tensors
+            if self._reusable_logits is None:
+                self._reusable_logits = Tensor(shape=(1, vocab_size), dtype=self.lm_head_weight.dtype(), device=self.device)
+            else:
+                # ensure shape matches (in case vocab_size differs between calls)
+                try:
+                    if tuple(int(s) for s in self._reusable_logits.shape()) != (1, vocab_size):
+                        self._reusable_logits = Tensor(shape=(1, vocab_size), dtype=self.lm_head_weight.dtype(), device=self.device)
+                except Exception:
+                    self._reusable_logits = Tensor(shape=(1, vocab_size), dtype=self.lm_head_weight.dtype(), device=self.device)
 
-            # allocate argmax outputs on the same device as model (avoid creating CPU tensors)
-            max_idx = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
-            max_val = Tensor(shape=(1,), dtype=DataType.F32, device=self.device)
-            Ops.argmax(max_idx, max_val, logits)
+            Ops.linear(self._reusable_logits, final_hidden_state, self.lm_head_weight, bias_t) # 现在 bias_t 永远有效
+
+            if self._reusable_argmax_idx is None:
+                self._reusable_argmax_idx = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
+            if self._reusable_argmax_val is None:
+                self._reusable_argmax_val = Tensor(shape=(1,), dtype=DataType.F32, device=self.device)
+
+            Ops.argmax(self._reusable_argmax_idx, self._reusable_argmax_val, self._reusable_logits)
 
             # Copy the single index value from device -> host with RuntimeAPI (D2H)
             import ctypes
             runtime = RuntimeAPI(self.device)
             host_ptr = runtime.malloc_host(ctypes.sizeof(ctypes.c_int64))
-            # src is the device pointer of max_idx
-            src_dev_ptr = ctypes.c_void_p(max_idx.data_ptr())
+            # src is the device pointer of the reusable argmax idx tensor
+            src_dev_ptr = ctypes.c_void_p(self._reusable_argmax_idx.data_ptr())
             runtime.memcpy_sync(host_ptr, src_dev_ptr, ctypes.sizeof(ctypes.c_int64), MemcpyKind.D2H)
             new_token_id = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_int64)).contents.value
             runtime.free_host(host_ptr)
