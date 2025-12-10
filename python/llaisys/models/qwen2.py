@@ -16,7 +16,8 @@ import json
 from ctypes import c_void_p
 from ..tensor import Tensor
 from .. import Ops
-from ..libllaisys import DeviceType as _DeviceType
+from ..libllaisys import DeviceType as _DeviceType, MemcpyKind
+from ..runtime import RuntimeAPI
 import math
 from ..libllaisys.triton import setup_kernels as _sk
 
@@ -414,13 +415,20 @@ class Qwen2:
             logits = Tensor(shape=(1, vocab_size), dtype=self.lm_head_weight.dtype(), device=self.device)
             Ops.linear(logits, final_hidden_state, self.lm_head_weight, bias_t) # 现在 bias_t 永远有效
 
-            max_idx = Tensor(shape=(1,), dtype=DataType.I64, device=DeviceType.CPU)
-            max_val = Tensor(shape=(1,), dtype=DataType.F32, device=DeviceType.CPU)
+            # allocate argmax outputs on the same device as model (avoid creating CPU tensors)
+            max_idx = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
+            max_val = Tensor(shape=(1,), dtype=DataType.F32, device=self.device)
             Ops.argmax(max_idx, max_val, logits)
-            
-            from ctypes import cast, POINTER, c_int64
-            ptr = max_idx.data_ptr()
-            new_token_id = cast(ptr, POINTER(c_int64)).contents.value
+
+            # Copy the single index value from device -> host with RuntimeAPI (D2H)
+            import ctypes
+            runtime = RuntimeAPI(self.device)
+            host_ptr = runtime.malloc_host(ctypes.sizeof(ctypes.c_int64))
+            # src is the device pointer of max_idx
+            src_dev_ptr = ctypes.c_void_p(max_idx.data_ptr())
+            runtime.memcpy_sync(host_ptr, src_dev_ptr, ctypes.sizeof(ctypes.c_int64), MemcpyKind.D2H)
+            new_token_id = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_int64)).contents.value
+            runtime.free_host(host_ptr)
             
             generated_tokens.append(new_token_id)
             
