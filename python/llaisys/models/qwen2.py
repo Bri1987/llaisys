@@ -354,6 +354,14 @@ class Qwen2:
         [最终版] 使用KV缓存生成序列。
         此版本修复了 lm_head_bias 的处理和模型维度的健壮性获取。
         """
+        # Accept optional `draft_k` for speculative/draft decoding prototype.
+        draft_k = 0
+        if 'draft_k' in kwargs:
+            try:
+                draft_k = int(kwargs.pop('draft_k'))
+            except Exception:
+                draft_k = 0
+
         if kwargs:
             print(f"[generate info] Ignoring extra arguments: {kwargs}")
             
@@ -436,68 +444,386 @@ class Qwen2:
         generated_tokens = []
         next_token_input = x.slice(0, prompt_len - 1, prompt_len)
 
-        for step in range(max_new_tokens):
-            final_hidden_state = next_token_input
-
-            # reuse or lazily allocate logits and argmax output tensors
-            if self._reusable_logits is None:
+        # helper: ensure reusable logits/argmax exist
+        def _ensure_reusable():
+            if self._reusable_logits is None or tuple(int(s) for s in self._reusable_logits.shape()) != (1, vocab_size):
                 self._reusable_logits = Tensor(shape=(1, vocab_size), dtype=self.lm_head_weight.dtype(), device=self.device)
-            else:
-                # ensure shape matches (in case vocab_size differs between calls)
-                try:
-                    if tuple(int(s) for s in self._reusable_logits.shape()) != (1, vocab_size):
-                        self._reusable_logits = Tensor(shape=(1, vocab_size), dtype=self.lm_head_weight.dtype(), device=self.device)
-                except Exception:
-                    self._reusable_logits = Tensor(shape=(1, vocab_size), dtype=self.lm_head_weight.dtype(), device=self.device)
-
-            Ops.linear(self._reusable_logits, final_hidden_state, self.lm_head_weight, bias_t) # 现在 bias_t 永远有效
-
             if self._reusable_argmax_idx is None:
                 self._reusable_argmax_idx = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
             if self._reusable_argmax_val is None:
                 self._reusable_argmax_val = Tensor(shape=(1,), dtype=DataType.F32, device=self.device)
 
+        import ctypes
+        runtime = RuntimeAPI(self.device)
+
+        # Local helper: convert LLAISYS Tensor -> numpy array (device -> host copy)
+        def _tensor_to_numpy(tensor: Tensor):
+            try:
+                shp = tuple(int(s) for s in tensor.shape())
+            except Exception:
+                shp = tuple()
+            # map DataType to numpy dtype
+            try:
+                dt = tensor.dtype()
+            except Exception:
+                dt = None
+            if dt == DataType.F32:
+                npdt = _np.float32
+            elif dt == DataType.F16:
+                npdt = _np.float16
+            elif dt == DataType.BF16:
+                npdt = ml_dtypes.bfloat16 if ml_dtypes else _np.float32
+            elif dt == DataType.I64:
+                npdt = _np.int64
+            elif dt == DataType.I32:
+                npdt = _np.int32
+            else:
+                npdt = _np.float32
+
+            elem_size = _np.dtype(npdt).itemsize
+            n_elems = 1
+            for s in shp:
+                n_elems *= int(s)
+            buf_bytes = int(n_elems * elem_size)
+            host_ptr = runtime.malloc_host(buf_bytes)
+            src_dev_ptr = ctypes.c_void_p(tensor.data_ptr())
+            runtime.memcpy_sync(host_ptr, src_dev_ptr, buf_bytes, MemcpyKind.D2H)
+            arr = _np.ctypeslib.as_array(ctypes.cast(host_ptr, ctypes.POINTER(_np.ctypeslib.as_ctypes_type(npdt))), shape=shp)
+            res = arr.copy()
+            runtime.free_host(host_ptr)
+            return res
+
+        def _softmax(x: _np.ndarray) -> _np.ndarray:
+            e_x = _np.exp(x - _np.max(x, axis=-1, keepdims=True))
+            return e_x / (e_x.sum(axis=-1, keepdims=True) + 1e-12)
+
+        # helper to run only the lm_head + argmax on an already-computed hidden state
+        def _lm_and_argmax(hidden_in: Tensor):
+            _ensure_reusable()
+            Ops.linear(self._reusable_logits, hidden_in, self.lm_head_weight, bias_t)
             Ops.argmax(self._reusable_argmax_idx, self._reusable_argmax_val, self._reusable_logits)
 
-            # Copy the single index value from device -> host with RuntimeAPI (D2H)
-            import ctypes
-            runtime = RuntimeAPI(self.device)
             host_ptr = runtime.malloc_host(ctypes.sizeof(ctypes.c_int64))
-            # src is the device pointer of the reusable argmax idx tensor
             src_dev_ptr = ctypes.c_void_p(self._reusable_argmax_idx.data_ptr())
             runtime.memcpy_sync(host_ptr, src_dev_ptr, ctypes.sizeof(ctypes.c_int64), MemcpyKind.D2H)
-            new_token_id = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_int64)).contents.value
+            tok = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_int64)).contents.value
             runtime.free_host(host_ptr)
-            
-            generated_tokens.append(new_token_id)
-            
-            if self.eos_token_id is not None and new_token_id == self.eos_token_id:
-                print(f"[generate info] EOS token ({self.eos_token_id}) generated. Stopping.")
-                break # 提前终止循环
+            return int(tok)
 
-            if step < max_new_tokens - 1:
-                current_pos = prompt_len + step
-                # reuse small numpy buffers and device tensors for single-token steps
-                if step == 0:
-                    # preallocate small host buffers and device tensors for reuse
-                    self._decode_pos_np = _np.zeros((1,), dtype=_np.int64)
-                    self._decode_pos_tensor = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
-                    self._decode_token_np = _np.zeros((1,), dtype=_np.int64)
-                    self._decode_token_tensor = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
-
-                self._decode_pos_np[0] = current_pos
+        # helper to embed a token and run through all layers (this updates the KV cache)
+        def _apply_token_and_forward(token_id: int, pos_val: int):
+            # reuse preallocated pos/token tensors to avoid per-step allocations
+            try:
+                self._decode_pos_np[0] = pos_val
                 self._decode_pos_tensor.load(c_void_p(self._decode_pos_np.ctypes.data))
+            except Exception:
+                # fallback: create a small tensor if reusable ones aren't present
+                pos_np2 = _np.array([pos_val], dtype=_np.int64)
+                pos_t2 = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
+                pos_t2.load(c_void_p(pos_np2.ctypes.data))
+                # ensure name used by downstream is present
+                self._decode_pos_tensor = pos_t2
 
-                self._decode_token_np[0] = new_token_id
-                self._decode_token_tensor.load(c_void_p(self._decode_token_np.ctypes.data))
+            # embed (reuse token tensor)
+            self._decode_token_np[0] = token_id
+            self._decode_token_tensor.load(c_void_p(self._decode_token_np.ctypes.data))
+            x_emb = self._get_scratch(0, "embedding_temp", (1, d_model), self.embed_weight.dtype())
+            Ops.embedding(x_emb, self._decode_token_tensor, self.embed_weight)
 
-                x = self._get_scratch(0, "embedding_temp", (1, d_model), self.embed_weight.dtype())
-                Ops.embedding(x, self._decode_token_tensor, self.embed_weight)
+            hcur = x_emb
+            for li in range(len(self.layers)):
+                hcur = self._block_forward(hcur, li, self._decode_pos_tensor)
+            return hcur
 
-                for i in range(len(self.layers)):
-                    x = self._block_forward(x, i, self._decode_pos_tensor)
-                
-                next_token_input = x
+        # Prepare a reusable speculative temp KV buffer to avoid per-iteration allocations
+        # `self._spec_temp_kv` is a list of per-layer dicts: {"k": Tensor, "v": Tensor, "len": int}
+        if not hasattr(self, '_spec_temp_kv') or self._spec_temp_kv is None:
+            self._spec_temp_kv = [None for _ in range(len(self.layers))]
+
+        # Main decode loop (can accept multiple draft tokens per iteration)
+        while len(generated_tokens) < max_new_tokens:
+            current_pos = prompt_len + len(generated_tokens)
+
+            # prepare small pos buffer reuse
+            if not hasattr(self, '_decode_pos_np'):
+                self._decode_pos_np = _np.zeros((1,), dtype=_np.int64)
+                self._decode_pos_tensor = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
+                self._decode_token_np = _np.zeros((1,), dtype=_np.int64)
+                self._decode_token_tensor = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
+
+            # If no drafting requested, fall back to single-step behavior
+            if draft_k <= 0:
+                tok = _lm_and_argmax(next_token_input)
+                # accept real token and update real cache
+                h_out = _apply_token_and_forward(tok, current_pos)
+                generated_tokens.append(tok)
+                if self.eos_token_id is not None and tok == self.eos_token_id:
+                    break
+                next_token_input = h_out
+                continue
+
+            # --- Speculative Drafting Path ---
+            # 1) snapshot original real caches
+            real_kv = self.kv_cache
+            real_cache_lens = [int(real_kv[li].get('len', 0)) for li in range(len(self.layers))]
+
+            # 2) prepare or reuse temp caches and copy existing data (one-time copy per iteration)
+            temp_kv = self._spec_temp_kv
+            for li in range(len(self.layers)):
+                cache_k = real_kv[li].get('k')
+                cache_v = real_kv[li].get('v')
+                cur_len = real_cache_lens[li]
+                num_heads = self.config.get("num_attention_heads")
+                kv_heads = self.config.get("num_key_value_heads") or num_heads
+                head_dim = d_model // num_heads
+
+                existing = temp_kv[li]
+                need_size = cur_len + draft_k
+                if existing is None:
+                    # allocate once and keep for reuse across decode iterations
+                    if cache_k is None:
+                        tk = Tensor(shape=(need_size, kv_heads, head_dim), dtype=DataType.F32, device=self.device)
+                        tv = Tensor(shape=(need_size, kv_heads, head_dim), dtype=DataType.F32, device=self.device)
+                    else:
+                        tk = Tensor(shape=(need_size, kv_heads, head_dim), dtype=cache_k.dtype(), device=self.device)
+                        tv = Tensor(shape=(need_size, kv_heads, head_dim), dtype=cache_v.dtype(), device=self.device)
+                    temp_kv[li] = {"k": tk, "v": tv, "len": cur_len}
+                    existing = temp_kv[li]
+                else:
+                    # If previously allocated buffer is too small, reallocate
+                    try:
+                        prev_shape = tuple(int(s) for s in existing['k'].shape())
+                    except Exception:
+                        prev_shape = None
+                    if prev_shape is None or prev_shape[0] < need_size:
+                        if cache_k is None:
+                            tk = Tensor(shape=(need_size, kv_heads, head_dim), dtype=DataType.F32, device=self.device)
+                            tv = Tensor(shape=(need_size, kv_heads, head_dim), dtype=DataType.F32, device=self.device)
+                        else:
+                            tk = Tensor(shape=(need_size, kv_heads, head_dim), dtype=cache_k.dtype(), device=self.device)
+                            tv = Tensor(shape=(need_size, kv_heads, head_dim), dtype=cache_v.dtype(), device=self.device)
+                        temp_kv[li] = {"k": tk, "v": tv, "len": cur_len}
+                        existing = temp_kv[li]
+                    else:
+                        existing['len'] = cur_len
+
+                # copy existing filled portion into temp caches (best-effort)
+                if cache_k is not None:
+                    try:
+                        _sk.kv_cache_write_slice(existing['k'], cache_k.slice(0, 0, cur_len), 0)
+                        _sk.kv_cache_write_slice(existing['v'], cache_v.slice(0, 0, cur_len), 0)
+                    except Exception:
+                        # best-effort: ignore copy failure and leave temp as-is
+                        pass
+
+            # 3) run draft generation on temp caches
+            # swap to temp
+            self.kv_cache = temp_kv
+            temp_hidden = next_token_input
+            temp_pos = current_pos
+            draft_seq = []
+            for dk in range(draft_k):
+                d_tok = _lm_and_argmax(temp_hidden)
+                # compute the hidden after appending draft token into temp cache
+                h_after = _apply_token_and_forward(d_tok, temp_pos)
+                draft_seq.append((d_tok, h_after))
+                # prepare next draft hidden/pos
+                temp_hidden = h_after
+                temp_pos += 1
+
+            # 4) validate draft tokens against real cache, but do verification on a
+            #    temporary `verify_kv` buffer to avoid per-token writes into the real cache.
+            #    After verification completes, commit accepted KV slices in a single D2D per-layer.
+            # prepare or reuse verify buffers
+            if not hasattr(self, '_spec_verify_kv') or self._spec_verify_kv is None:
+                self._spec_verify_kv = [None for _ in range(len(self.layers))]
+
+            verify_kv = self._spec_verify_kv
+            for li in range(len(self.layers)):
+                cache_k = real_kv[li].get('k')
+                cache_v = real_kv[li].get('v')
+                cur_len = real_cache_lens[li]
+                num_heads = self.config.get("num_attention_heads")
+                kv_heads = self.config.get("num_key_value_heads") or num_heads
+                head_dim = d_model // num_heads
+
+                existing = verify_kv[li]
+                need_size = cur_len + draft_k
+                if existing is None:
+                    if cache_k is None:
+                        vk = Tensor(shape=(need_size, kv_heads, head_dim), dtype=DataType.F32, device=self.device)
+                        vv = Tensor(shape=(need_size, kv_heads, head_dim), dtype=DataType.F32, device=self.device)
+                    else:
+                        vk = Tensor(shape=(need_size, kv_heads, head_dim), dtype=cache_k.dtype(), device=self.device)
+                        vv = Tensor(shape=(need_size, kv_heads, head_dim), dtype=cache_v.dtype(), device=self.device)
+                    verify_kv[li] = {"k": vk, "v": vv, "len": cur_len}
+                    existing = verify_kv[li]
+                else:
+                    try:
+                        prev_shape = tuple(int(s) for s in existing['k'].shape())
+                    except Exception:
+                        prev_shape = None
+                    if prev_shape is None or prev_shape[0] < need_size:
+                        if cache_k is None:
+                            vk = Tensor(shape=(need_size, kv_heads, head_dim), dtype=DataType.F32, device=self.device)
+                            vv = Tensor(shape=(need_size, kv_heads, head_dim), dtype=DataType.F32, device=self.device)
+                        else:
+                            vk = Tensor(shape=(need_size, kv_heads, head_dim), dtype=cache_k.dtype(), device=self.device)
+                            vv = Tensor(shape=(need_size, kv_heads, head_dim), dtype=cache_v.dtype(), device=self.device)
+                        verify_kv[li] = {"k": vk, "v": vv, "len": cur_len}
+                        existing = verify_kv[li]
+                    else:
+                        existing['len'] = cur_len
+
+                # copy existing filled portion from real cache into verify buffer
+                if cache_k is not None:
+                    try:
+                        _sk.kv_cache_write_slice(existing['k'], cache_k.slice(0, 0, cur_len), 0)
+                        _sk.kv_cache_write_slice(existing['v'], cache_v.slice(0, 0, cur_len), 0)
+                    except Exception:
+                        pass
+
+            # Run verification on verify_kv using a single batched forward over the draft tokens.
+            # This avoids per-token writes into the real cache and reduces number of real-model forwards.
+            draft_tokens = [int(dt[0]) for dt in draft_seq]
+
+            # compute draft logits on temp_kv (we already produced draft_tokens on temp_kv, but
+            # recomputing logits in one pass is simpler and keeps code paths consistent)
+            self.kv_cache = temp_kv
+            try:
+                draft_hidden = self._forward_sequence(draft_tokens)
+                draft_logits_t = self._get_logits_from_hidden_states(draft_hidden)
+                draft_logits_np = None
+                try:
+                    draft_logits_np = _tensor_to_numpy(draft_logits_t)
+                except Exception:
+                    # fallback: compute per-step logits if conversion fails
+                    draft_logits_np = []
+                    for i in range(len(draft_tokens)):
+                        l = self._get_logits_from_hidden_states(draft_hidden.slice(0, i, i+1))
+                        draft_logits_np.append(_tensor_to_numpy(l)[0])
+                    draft_logits_np = _np.stack(draft_logits_np, axis=0)
+            except Exception:
+                # if draft forward fails, fall back to naive per-token draft_seq values
+                draft_logits_np = None
+
+            # compute target logits on verify_kv in one pass
+            self.kv_cache = verify_kv
+            try:
+                target_hidden = self._forward_sequence(draft_tokens)
+                target_logits_t = self._get_logits_from_hidden_states(target_hidden)
+                target_logits_np = _tensor_to_numpy(target_logits_t)
+            except Exception:
+                # worst-case: fall back to original per-token verification
+                self.kv_cache = real_kv
+                real_hidden = next_token_input
+                accepted_count = 0
+                for j, (d_tok, d_hidden) in enumerate(draft_seq):
+                    r_tok = _lm_and_argmax(real_hidden)
+                    h_real_new = _apply_token_and_forward(r_tok, current_pos + j)
+                    generated_tokens.append(int(r_tok))
+                    real_hidden = h_real_new
+                    accepted_count += 1
+                    if self.eos_token_id is not None and int(r_tok) == self.eos_token_id:
+                        break
+                    if len(generated_tokens) >= max_new_tokens:
+                        break
+                # restore real cache and continue
+                self.kv_cache = real_kv
+                next_token_input = real_hidden
+                # proceed to commit below as accepted_count may be >0
+                target_hidden = None
+                target_logits_np = None
+
+            # Decide acceptance by comparing draft vs target logits.
+            accepted_count = 0
+            if 'target_logits_np' in locals() and target_logits_np is not None:
+                L = len(draft_tokens)
+                for i in range(L):
+                    if len(generated_tokens) >= max_new_tokens:
+                        break
+                    tgt_logits = target_logits_np[i]
+                    if draft_logits_np is not None:
+                        dft_logits = draft_logits_np[i]
+                    else:
+                        dft_logits = None
+
+                    # greedy check first
+                    tgt_arg = int(_np.argmax(tgt_logits))
+                    if tgt_arg == draft_tokens[i]:
+                        generated_tokens.append(int(tgt_arg))
+                        accepted_count += 1
+                        # early stop on EOS
+                        if self.eos_token_id is not None and tgt_arg == self.eos_token_id:
+                            break
+                        continue
+
+                    # probabilistic acceptance using probability ratio (friend's idea)
+                    try:
+                        p_tgt = _softmax(tgt_logits)[draft_tokens[i]]
+                        if dft_logits is not None:
+                            p_dft = _softmax(dft_logits)[draft_tokens[i]]
+                        else:
+                            p_dft = 1e-6
+                        accept_prob = float(p_tgt / (p_dft + 1e-9))
+                    except Exception:
+                        accept_prob = 0.0
+
+                    if _np.random.rand() < accept_prob:
+                        generated_tokens.append(int(draft_tokens[i]))
+                        accepted_count += 1
+                        continue
+                    else:
+                        # sampling from target_logits distribution as fallback
+                        probs = _softmax(tgt_logits)
+                        try:
+                            sampled = int(_np.random.choice(len(probs), p=probs))
+                        except Exception:
+                            sampled = int(tgt_arg)
+                        generated_tokens.append(sampled)
+                        accepted_count += 1
+                        break
+
+            # commit accepted KV slices from verify_kv -> real_kv in one shot per-layer
+            for li in range(len(self.layers)):
+                cache_k = real_kv[li].get('k')
+                cache_v = real_kv[li].get('v')
+                if cache_k is None:
+                    # if real cache missing, install from verify buffer
+                    if accepted_count > 0:
+                        real_k = Tensor(shape=(cur_len + accepted_count, verify_kv[li]['k'].shape()[1], verify_kv[li]['k'].shape()[2]), dtype=verify_kv[li]['k'].dtype(), device=self.device)
+                        real_v = Tensor(shape=(cur_len + accepted_count, verify_kv[li]['v'].shape()[1], verify_kv[li]['v'].shape()[2]), dtype=verify_kv[li]['v'].dtype(), device=self.device)
+                        # copy back full
+                        try:
+                            _sk.kv_cache_write_slice(real_k, verify_kv[li]['k'].slice(0, 0, cur_len + accepted_count), 0)
+                            _sk.kv_cache_write_slice(real_v, verify_kv[li]['v'].slice(0, 0, cur_len + accepted_count), 0)
+                            self.kv_cache[li]['k'] = real_k
+                            self.kv_cache[li]['v'] = real_v
+                            self.kv_cache[li]['len'] = cur_len + accepted_count
+                        except Exception:
+                            pass
+                else:
+                    if accepted_count > 0:
+                        try:
+                            # src slice is verify_kv[li]['k'].slice(cur_len, 0, cur_len + accepted_count)
+                            _sk.kv_cache_write_slice(cache_k, verify_kv[li]['k'].slice(cur_len, 0, cur_len + accepted_count), cur_len)
+                            _sk.kv_cache_write_slice(cache_v, verify_kv[li]['v'].slice(cur_len, 0, cur_len + accepted_count), cur_len)
+                            self.kv_cache[li]['len'] = cur_len + accepted_count
+                        except Exception:
+                            pass
+
+            # restore real cache and set next input
+            self.kv_cache = real_kv
+            next_token_input = real_hidden
+
+            # safety: if no tokens were accepted (edge-case), advance by one conservative real step
+            if len(generated_tokens) < 1 + (current_pos - prompt_len):
+                tok = _lm_and_argmax(next_token_input)
+                h_out = _apply_token_and_forward(tok, current_pos)
+                generated_tokens.append(tok)
+                if self.eos_token_id is not None and tok == self.eos_token_id:
+                    break
+                next_token_input = h_out
 
         return prompt_tokens + generated_tokens
 
@@ -509,6 +835,8 @@ class Qwen2:
         layer = self.layers[layer_idx]
         seq_len = x.shape()[0]
         d_model = x.shape()[1]
+        # debug info: capacity and current filled length
+        # debug info (disabled in normal runs)
 
         # 1. RMSNorm
         ln1_w = layer.get("ln1")
