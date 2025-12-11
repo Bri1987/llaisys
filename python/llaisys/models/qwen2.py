@@ -409,7 +409,10 @@ class Qwen2:
             Ops.embedding(x, prompt_ids, self.embed_weight)
 
             # Prepare per-layer KV caches for decode: allocate capacity = prompt_len + max_new_tokens
-            total_capacity = prompt_len + max_new_tokens
+            # Add a small safety margin to avoid slice/index errors when generation
+            # produces slightly more tokens than planned (race/rounding/etc).
+            SAFETY_MARGIN = 16
+            total_capacity = prompt_len + max_new_tokens + SAFETY_MARGIN
             num_heads = self.config.get("num_attention_heads")
             kv_heads = self.config.get("num_key_value_heads") or num_heads
             head_dim = d_model // num_heads
@@ -452,24 +455,110 @@ class Qwen2:
 
             Ops.linear(self._reusable_logits, final_hidden_state, self.lm_head_weight, bias_t) # 现在 bias_t 永远有效
 
-            if self._reusable_argmax_idx is None:
-                self._reusable_argmax_idx = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
-            if self._reusable_argmax_val is None:
-                self._reusable_argmax_val = Tensor(shape=(1,), dtype=DataType.F32, device=self.device)
+            # Sampling / greedy selection support
+            do_sample = bool(kwargs.get("do_sample", False))
+            temperature = float(kwargs.get("temperature", 1.0))
+            top_k = int(kwargs.get("top_k", 0))
+            top_p = float(kwargs.get("top_p", 0.0))
 
-            Ops.argmax(self._reusable_argmax_idx, self._reusable_argmax_val, self._reusable_logits)
+            new_token_id = None
 
-            # Copy the single index value from device -> host with RuntimeAPI (D2H)
-            import ctypes
-            runtime = RuntimeAPI(self.device)
-            host_ptr = runtime.malloc_host(ctypes.sizeof(ctypes.c_int64))
-            # src is the device pointer of the reusable argmax idx tensor
-            src_dev_ptr = ctypes.c_void_p(self._reusable_argmax_idx.data_ptr())
-            runtime.memcpy_sync(host_ptr, src_dev_ptr, ctypes.sizeof(ctypes.c_int64), MemcpyKind.D2H)
-            new_token_id = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_int64)).contents.value
-            runtime.free_host(host_ptr)
+            if do_sample or temperature != 1.0 or top_k > 0 or (top_p > 0.0 and top_p < 1.0):
+                # Copy logits from device -> host and perform sampling in numpy
+                import ctypes
+                runtime = RuntimeAPI(self.device)
+                # determine logits dtype and element size
+                logits_dtype = self._reusable_logits.dtype()
+
+                if logits_dtype == DataType.F32:
+                    elem_size = ctypes.sizeof(ctypes.c_float)
+                    HostArrayType = ctypes.c_float
+                else:
+                    # BF16 / F16 are stored as 16-bit values on device
+                    elem_size = ctypes.sizeof(ctypes.c_uint16)
+                    HostArrayType = ctypes.c_uint16
+
+                host_ptr = runtime.malloc_host(elem_size * vocab_size)
+                src_dev_ptr = ctypes.c_void_p(self._reusable_logits.data_ptr())
+                runtime.memcpy_sync(host_ptr, src_dev_ptr, elem_size * vocab_size, MemcpyKind.D2H)
+
+                # Create numpy view from host buffer
+                if HostArrayType is ctypes.c_float:
+                    arr = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_float * vocab_size)).contents
+                    logits_np = _np.ctypeslib.as_array(arr).astype(_np.float32)
+                else:
+                    arr = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_uint16 * vocab_size)).contents
+                    u16 = _np.ctypeslib.as_array(arr).astype(_np.uint16)
+                    # Convert BF16/FP16 -> FP32
+                    if logits_dtype == DataType.BF16:
+                        u32 = u16.astype(_np.uint32) << 16
+                        logits_np = u32.view(_np.float32)
+                    else:
+                        # FP16
+                        logits_np = u16.view(_np.float16).astype(_np.float32)
+
+                # apply temperature
+                if temperature != 1.0 and temperature > 0.0:
+                    logits_np = logits_np / float(temperature)
+
+                # apply top-k
+                if top_k > 0 and top_k < vocab_size:
+                    # find threshold
+                    kth = _np.partition(-logits_np, top_k - 1)[top_k - 1]
+                    mask = logits_np >= -kth
+                    logits_np = _np.where(mask, logits_np, -1e9)
+
+                # apply top-p (nucleus)
+                if top_p > 0.0 and top_p < 1.0:
+                    sorted_idx = _np.argsort(-logits_np)
+                    sorted_logits = logits_np[sorted_idx]
+                    exp = _np.exp(sorted_logits - sorted_logits.max())
+                    probs_sorted = exp / exp.sum()
+                    cumsum = _np.cumsum(probs_sorted)
+                    # keep smallest set where cumsum <= top_p (ensure at least one)
+                    keep_mask = cumsum <= top_p
+                    if not _np.any(keep_mask):
+                        keep_mask[0] = True
+                    cutoff = sorted_logits[~keep_mask]
+                    if cutoff.size > 0:
+                        thresh = cutoff.max()
+                        logits_np = _np.where(logits_np >= thresh, logits_np, -1e9)
+
+                # softmax and sample
+                logits_np = logits_np - logits_np.max()
+                exp_logits = _np.exp(logits_np)
+                probs = exp_logits / (exp_logits.sum() + 1e-20)
+                new_token_id = int(_np.random.choice(vocab_size, p=probs))
+
+                runtime.free_host(host_ptr)
+            else:
+                # Greedy path: keep existing argmax code
+                if self._reusable_argmax_idx is None:
+                    self._reusable_argmax_idx = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
+                if self._reusable_argmax_val is None:
+                    self._reusable_argmax_val = Tensor(shape=(1,), dtype=DataType.F32, device=self.device)
+
+                Ops.argmax(self._reusable_argmax_idx, self._reusable_argmax_val, self._reusable_logits)
+
+                # Copy the single index value from device -> host with RuntimeAPI (D2H)
+                import ctypes
+                runtime = RuntimeAPI(self.device)
+                host_ptr = runtime.malloc_host(ctypes.sizeof(ctypes.c_int64))
+                # src is the device pointer of the reusable argmax idx tensor
+                src_dev_ptr = ctypes.c_void_p(self._reusable_argmax_idx.data_ptr())
+                runtime.memcpy_sync(host_ptr, src_dev_ptr, ctypes.sizeof(ctypes.c_int64), MemcpyKind.D2H)
+                new_token_id = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_int64)).contents.value
+                runtime.free_host(host_ptr)
             
             generated_tokens.append(new_token_id)
+            # 如果调用方传入 token_callback，则在每生成一个 token 时调用它
+            token_callback = kwargs.get('token_callback')
+            try:
+                if callable(token_callback):
+                    token_callback(new_token_id)
+            except Exception:
+                # callback 不应影响生成流程
+                pass
             
             if self.eos_token_id is not None and new_token_id == self.eos_token_id:
                 print(f"[generate info] EOS token ({self.eos_token_id}) generated. Stopping.")
@@ -520,6 +609,40 @@ class Qwen2:
         cache_k = self.kv_cache[layer_idx].get("k")
         cache_v = self.kv_cache[layer_idx].get("v")
         start_pos = int(self.kv_cache[layer_idx].get("len", 0))
+
+        # Ensure KV cache has enough capacity; if not, grow it and copy old contents.
+        # Use a doubling strategy with safety margin to avoid frequent reallocations.
+        KV_SAFETY_MARGIN = 32
+        try:
+            if cache_k is not None:
+                try:
+                    cap = int(cache_k.shape()[0])
+                except Exception:
+                    cap = None
+                if cap is None or (start_pos + x.shape()[0] > cap):
+                    # compute new capacity
+                    needed = start_pos + x.shape()[0] + KV_SAFETY_MARGIN
+                    new_cap = max(needed, (cap * 2) if cap is not None else needed)
+                    # create new caches and copy old data
+                    kv_heads = self.config.get("num_key_value_heads") or self.config.get("num_attention_heads")
+                    head_dim = x.shape()[1] // self.config.get("num_attention_heads")
+                    new_k = _sk.create_kv_cache(new_cap, kv_heads, head_dim, self.layers[layer_idx]["k_w"].dtype(), self.device)
+                    new_v = _sk.create_kv_cache(new_cap, kv_heads, head_dim, self.layers[layer_idx]["v_w"].dtype(), self.device)
+                    # copy existing contents if any
+                    if cap is not None and cap > 0:
+                        # src slices are (cap, kv_heads, head_dim)
+                        old_k_slice = cache_k.slice(0, 0, cap)
+                        old_v_slice = cache_v.slice(0, 0, cap)
+                        _sk.kv_cache_write_slice(new_k, old_k_slice, 0)
+                        _sk.kv_cache_write_slice(new_v, old_v_slice, 0)
+                    # replace cache pointers
+                    self.kv_cache[layer_idx]["k"] = new_k
+                    self.kv_cache[layer_idx]["v"] = new_v
+                    cache_k = new_k
+                    cache_v = new_v
+        except Exception:
+            # best-effort: if expansion fails, continue and let downstream error surface
+            pass
         
         num_heads = self.config.get("num_attention_heads")
         kv_heads = self.config.get("num_key_value_heads")
