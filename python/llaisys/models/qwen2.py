@@ -350,12 +350,6 @@ class Qwen2:
         max_new_tokens: int = None,
         **kwargs  # <--- 【核心修改】添加这部分
     ):
-        """
-        [最终版] 使用KV缓存生成序列。
-        此版本修复了 lm_head_bias 的处理和模型维度的健壮性获取。
-        """
-        if kwargs:
-            print(f"[generate info] Ignoring extra arguments: {kwargs}")
             
         if max_new_tokens is None:
             max_new_tokens = 1
@@ -497,38 +491,49 @@ class Qwen2:
                         # FP16
                         logits_np = u16.view(_np.float16).astype(_np.float32)
 
-                # apply temperature
+                # 1. 应用 temperature
                 if temperature != 1.0 and temperature > 0.0:
                     logits_np = logits_np / float(temperature)
 
-                # apply top-k
+                # 2. 将 logits 转换为概率分布
+                #    为了数值稳定性，我们先减去最大值
+                logits_np -= _np.max(logits_np)
+                probs = _np.exp(logits_np)
+                probs /= _np.sum(probs)
+
+                # 3. 应用 Top-K 过滤
+                #    原理：将不在 top-k 范围内的词元的概率直接设置为 0
                 if top_k > 0 and top_k < vocab_size:
-                    # find threshold
-                    kth = _np.partition(-logits_np, top_k - 1)[top_k - 1]
-                    mask = logits_np >= -kth
-                    logits_np = _np.where(mask, logits_np, -1e9)
+                    # 找到 top-k 的概率值门槛
+                    kth_prob = _np.partition(probs, -top_k)[-top_k]
+                    # 将所有概率小于这个门槛的都设为0
+                    probs[probs < kth_prob] = 0.0
 
-                # apply top-p (nucleus)
+                # 4. 应用 Top-P (Nucleus) 过滤
+                #    原理：按概率从大到小排序，累加概率直到超过 p，然后将剩余的词元概率设为 0
                 if top_p > 0.0 and top_p < 1.0:
-                    sorted_idx = _np.argsort(-logits_np)
-                    sorted_logits = logits_np[sorted_idx]
-                    exp = _np.exp(sorted_logits - sorted_logits.max())
-                    probs_sorted = exp / exp.sum()
-                    cumsum = _np.cumsum(probs_sorted)
-                    # keep smallest set where cumsum <= top_p (ensure at least one)
-                    keep_mask = cumsum <= top_p
-                    if not _np.any(keep_mask):
-                        keep_mask[0] = True
-                    cutoff = sorted_logits[~keep_mask]
-                    if cutoff.size > 0:
-                        thresh = cutoff.max()
-                        logits_np = _np.where(logits_np >= thresh, logits_np, -1e9)
+                    # 获取排序后的索引
+                    sorted_indices = _np.argsort(probs)[::-1]
+                    sorted_probs = probs[sorted_indices]
+                    
+                    # 计算累积概率
+                    cumulative_probs = _np.cumsum(sorted_probs)
+                    
+                    # 找到需要移除的词元（那些累积概率超过 top_p 的）
+                    # We keep all tokens whose cumulative probability is not greater than top_p
+                    indices_to_remove = cumulative_probs > top_p
+                    # 但是要确保我们至少保留了概率最高的那一个词元
+                    indices_to_remove[..., 0] = False 
 
-                # softmax and sample
-                logits_np = logits_np - logits_np.max()
-                exp_logits = _np.exp(logits_np)
-                probs = exp_logits / (exp_logits.sum() + 1e-20)
-                new_token_id = int(_np.random.choice(vocab_size, p=probs))
+                    # 将这些词元的概率设置为 0
+                    original_indices_to_remove = sorted_indices[indices_to_remove]
+                    probs[original_indices_to_remove] = 0.0
+
+                # 5. 重新归一化概率并采样
+                #    由于我们可能将很多词元的概率设为了0，需要重新归一化，确保总和为1
+                #    添加一个极小值防止除以零
+                final_probs = probs / (_np.sum(probs) + 1e-9)
+                new_token_id = int(_np.random.choice(vocab_size, p=final_probs))
 
                 runtime.free_host(host_ptr)
             else:
@@ -551,18 +556,27 @@ class Qwen2:
                 runtime.free_host(host_ptr)
             
             generated_tokens.append(new_token_id)
-            # 如果调用方传入 token_callback，则在每生成一个 token 时调用它
-            token_callback = kwargs.get('token_callback')
-            try:
-                if callable(token_callback):
-                    token_callback(new_token_id)
-            except Exception:
-                # callback 不应影响生成流程
-                pass
             
+            # --- 【核心修正】 ---
+            # 检查 token_callback 的返回值来决定是否继续
+            token_callback = kwargs.get('token_callback')
+            keep_generating = True
+            if callable(token_callback):
+                try:
+                    # 如果回调返回 False，我们就停止生成
+                    if token_callback(new_token_id) is False:
+                        keep_generating = False
+                except Exception:
+                    # 回调中的异常不应中断主流程，但我们同样停止生成以防万一
+                    keep_generating = False
+            
+            if not keep_generating:
+                print("[generate info] Stopping generation due to token_callback signal.")
+                break # <-- 关键的 break！
+
             if self.eos_token_id is not None and new_token_id == self.eos_token_id:
                 print(f"[generate info] EOS token ({self.eos_token_id}) generated. Stopping.")
-                break # 提前终止循环
+                break
 
             if step < max_new_tokens - 1:
                 current_pos = prompt_len + step
