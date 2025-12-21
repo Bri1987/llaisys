@@ -1,17 +1,12 @@
-# 文件名: llaisys/models/chat_server.py (或您的 api.py)
-
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import StreamingResponse, JSONResponse
 import os
 import json
 import time
 from typing import List, Dict
-# [核心改动] 引入 multiprocessing
 import multiprocessing as mp
-# queue 在 multiprocessing 中有自己的版本
 from multiprocessing import Queue
 
-# --- 模型工作函数 (将在一个独立的子进程中运行) ---
 # 这个函数包含了所有与模型和tokenizer相关的操作
 def model_worker_func(
     model_path: str,
@@ -32,7 +27,6 @@ def model_worker_func(
         # print(f"[Worker PID: {os.getpid()}] Loading model and tokenizer...")
         
         # 2. 加载模型和Tokenizer
-        # 注意：这里的 device 可以根据您的环境设置
         model = Qwen2(model_path, device=DeviceType.NVIDIA)
         tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
         
@@ -67,7 +61,7 @@ CONVERSATION_HISTORY: List[Dict[str, str]] = []
 MAX_HISTORY_TURNS = 10
 history_lock = mp.Lock() # 使用 multiprocessing 的锁
 
-# [重要] 主进程不加载模型，只记录路径
+# 主进程不加载模型，只记录路径
 MODEL_PATH = os.environ.get("LLAISYS_MODEL_PATH", None)
 if not MODEL_PATH:
     raise RuntimeError("LLAISYS_MODEL_PATH environment variable must be set.")
@@ -179,9 +173,3 @@ async def chat_completions(req: Request):
                     CONVERSATION_HISTORY.append({"role": "assistant", "content": response_text})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-if __name__ == '__main__':
-    # [重要] 确保在Windows/MacOS上多进程的安全性
-    mp.set_start_method("fork") # 在Linux上fork是默认且高效的
-    import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000)

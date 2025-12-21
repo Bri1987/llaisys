@@ -4,13 +4,8 @@ from ..libllaisys import DeviceType, DataType
 
 from pathlib import Path
 import safetensors
-# 【第1步：确保导入】
-# 引入 ml_dtypes，它会扩展 Numpy 的能力，使其能够理解 bfloat16。
-# 我们使用 try-except 来避免在没有安装它的环境中崩溃。
-try:
-    import ml_dtypes
-except ImportError:
-    ml_dtypes = None
+# 引入 ml_dtypes，它会扩展 Numpy 的能力，使其能够理解 bfloat16
+import ml_dtypes
 import numpy as _np
 import json
 from ctypes import c_void_p
@@ -61,7 +56,6 @@ class Qwen2:
                     print(f"Warning: Failed to load tensor '{name_}' from {file}. Error: {e}")
                     self.skipped_keys.append(name_)
         
-        # 【第2步：修改这里】
         # _np_to_dtype 函数现在可以正确地将 numpy 的 bfloat16 映射到 llaisys 的 BF16
         def _np_to_dtype(npdtype):
             if npdtype == _np.float32:
@@ -99,9 +93,6 @@ class Qwen2:
                 print(f"Error: Failed to convert numpy array '{name}' to llaisys.Tensor. Error: {e}")
                 self.skipped_keys.append(name)
 
-        # ... 后续的所有代码（构建层、fail-fast检查等）都保持不变 ...
-
-        # Build convenient references
         embed_keys = ["model.embed_tokens.weight", "embed_tokens.weight"]
         self.embed_weight = None
         for k in embed_keys:
@@ -130,7 +121,6 @@ class Qwen2:
                 f"This might be due to an unsupported dtype. Skipped keys: [{skipped_info}]"
             )
 
-        # Determine number of layers
         num_layers = self.config.get("num_hidden_layers", 0)
         if num_layers == 0:
             layer_idxs = set()
@@ -164,55 +154,21 @@ class Qwen2:
             }
             self.layers.append(layer)
 
-        # KV cache storage per layer: will hold LLAISYS Tensor objects for past k/v
+        # 每一层的 KV 缓存：用于存放过去生成的 key/value 张量
         self.kv_cache = [ {"k": None, "v": None, "len": 0} for _ in range(num_layers) ]
-        # By default we assume the Triton kernel will write new K/V into
-        # an existing past buffer in-place during decode. When True, the
-        # Python-side code will NOT perform an extra `torch.cat` append
-        # to avoid double-appending the same key/value vectors.
-        # Set to False to let Python manage concatenation instead.
-        # self.kv_append_via_kernel = True
+        # decode模式下，我们默认 Triton 内核会直接将新的 K/V 写入（in-place）到缓存中
 
-        # per-layer scratch tensors to avoid repeated allocations during
-        # per-token / per-layer forward calls. Each entry is a dict
-        # mapping a short name -> Tensor instance that will be reused.
+        # 为每一层准备的临时计算空间（scratch tensors），避免在每次前向传播时重复申请内存
         self.layer_scratch = [dict() for _ in range(num_layers)]
 
-        # Reusable tensors for decode: lazily initialized to avoid
-        # allocating per-token logits/argmax outputs every step.
+        # 用于解码的可重用张量：采用懒加载（lazily initialized）方式，
+        # 避免在生成每个 token 时都重复创建 logits 和 argmax 这些输出张量
         self._reusable_logits = None
         self._reusable_argmax_idx = None
         self._reusable_argmax_val = None
-        # Cached lm_head bias (if model didn't provide one)
+        # 缓存的 lm_head 偏置（如果模型没有提供）
         self._cached_lm_head_bias = None
 
-
-    def _log_tensor(self, name: str, t: Tensor, topk: int = 5):
-        """Best-effort logging for a LLAISYS `Tensor`.
-
-        Converts to a device `torch.Tensor` via the triton bridge when
-        possible and prints shape, dtype, mean/std and top-k values for
-        1-D/2-D tensors. Wrapped in try/except to avoid impacting runtime.
-        """
-        try:
-            # Lightweight, torch-free logging: print shape and dtype if available.
-            shp = None
-            dtype = None
-            try:
-                if hasattr(t, 'shape') and callable(getattr(t, 'shape')):
-                    shp = tuple(int(s) for s in t.shape())
-                elif hasattr(t, 'shape'):
-                    shp = tuple(int(s) for s in t.shape)
-            except Exception:
-                shp = None
-            try:
-                dtype = t.dtype()
-            except Exception:
-                dtype = None
-            print(f"[debug.tensor] {name} shape={shp} dtype={dtype}")
-        except Exception:
-            # never crash due to logging
-            pass
 
     def _get_scratch(self, layer_idx: int, name: str, shape, dtype):
         """Get or allocate a reusable scratch Tensor for `layer_idx`.
@@ -249,102 +205,6 @@ class Qwen2:
         self.layer_scratch[layer_idx][name] = t
         return t
 
-    def validate_parameters(self, verbose: bool = False):
-        """检查并返回已加载参数的摘要。
-
-        返回一个字典，包含每个参数的存在性、类型、shape（若可得）和 dtype（若可得），
-        以及一个 issues 列表用于记录缺失或异常的键。
-
-        用法示例：
-            q = Qwen2(model_path)
-            report = q.validate_parameters(verbose=True)
-        """
-        summary = {}
-        issues = []
-
-        def _safe_shape_and_dtype(obj):
-            # try numpy.ndarray
-            try:
-                import numpy as _np
-                if isinstance(obj, _np.ndarray):
-                    return (tuple(int(s) for s in obj.shape), str(obj.dtype))
-            except Exception:
-                pass
-
-            # llaisys.Tensor-like: try .shape() then .shape attr
-            try:
-                if hasattr(obj, 'shape') and callable(getattr(obj, 'shape')):
-                    shp = tuple(int(s) for s in obj.shape())
-                elif hasattr(obj, 'shape'):
-                    shp = tuple(int(s) for s in obj.shape)
-                else:
-                    shp = None
-            except Exception:
-                shp = None
-
-            # dtype probing
-            try:
-                if hasattr(obj, 'dtype') and callable(getattr(obj, 'dtype')):
-                    dt = obj.dtype()
-                elif hasattr(obj, 'dtype'):
-                    dt = obj.dtype
-                else:
-                    dt = None
-            except Exception:
-                dt = None
-
-            # normalize dtype string
-            try:
-                if dt is not None:
-                    dt = str(dt)
-            except Exception:
-                dt = None
-
-            return (shp, dt)
-
-        for k, v in sorted(self.params.items()):
-            info = {"present_in_params": True}
-            shp, dt = _safe_shape_and_dtype(v)
-            info.update({"shape_in_params": shp, "dtype_in_params": dt})
-            # also check if converted to self.tensors
-            in_t = k in self.tensors
-            info["present_in_tensors"] = in_t
-            if in_t:
-                shp2, dt2 = _safe_shape_and_dtype(self.tensors[k])
-                info.update({"shape_in_tensors": shp2, "dtype_in_tensors": dt2})
-            else:
-                info.update({"shape_in_tensors": None, "dtype_in_tensors": None})
-            summary[k] = info
-            # record potential issue
-            if not in_t:
-                issues.append(f"skipped_or_not_converted: {k}")
-
-        # check required keys
-        required = ["model.embed_tokens.weight", "lm_head.weight"]
-        for rk in required:
-            if rk not in self.tensors:
-                # check alternative keys too
-                alt_found = False
-                for alt in ("embed_tokens.weight", "wte.weight", "tok_embeddings.weight", "model.lm_head.weight", "lm_head.decoder.weight"):
-                    if alt in self.tensors:
-                        alt_found = True
-                        break
-                if not alt_found:
-                    issues.append(f"required_missing: {rk}")
-
-        report = {"summary": summary, "issues": issues}
-        if verbose:
-            import json
-            print(json.dumps({k: {"shape": v.get("shape_in_tensors") or v.get("shape_in_params"), "dtype": v.get("dtype_in_tensors") or v.get("dtype_in_params"), "in_tensors": v.get("present_in_tensors")} for k, v in summary.items()}, indent=2))
-            if issues:
-                print("Issues:\n", "\n".join(issues))
-
-        return report
-
-    # ... (文件顶部的 import 和 __init__ 方法保持不变) ...
-# ... 您可以删除 __init__ 方法中的 self.kv_append_via_kernel = True 这一行，因为它不再需要了 ...
-
-    # In qwen2.py, inside the Qwen2 class
 
     def generate(
         self,
@@ -356,19 +216,10 @@ class Qwen2:
         top_p: float = 0.0,
         **kwargs  # 兼容旧的额外参数
     ):
-        """
-        [最终修复版] 使用KV缓存生成序列。
-        此版本在函数入口处增加了对KV Cache状态的强制重置，解决了因状态污染导致的连续调用崩溃问题。
-        """
-        # --- [核心修复] ---
         # 在每次调用 generate 时，必须重置 KV 缓存的已写入长度。
-        # 这确保了即使复用已分配的 Tensor，新的序列也会从头开始写入，
-        # 从而避免了因状态污染导致的底层内存访问错误。
         for layer_cache in self.kv_cache:
             layer_cache['len'] = 0
-        # --- 修复结束 ---
-
-        # 提取可能的回调（streaming 使用），其余 kwargs 仍然兼容但不使用
+            
         token_callback = None
         if kwargs:
             token_callback = kwargs.pop("token_callback", None)
@@ -378,7 +229,6 @@ class Qwen2:
         if max_new_tokens is None:
             max_new_tokens = 1
 
-        # --- [FIX 2] 健壮地获取模型维度 ---
         # 优先从 config 获取，如果失败，则从权重张量推断
         d_model = self.config.get("hidden_size")
         if d_model is None:
@@ -388,16 +238,14 @@ class Qwen2:
         if vocab_size is None:
             vocab_size = self.lm_head_weight.shape()[0]
 
-        # --- [FIX 1] 预先准备好 lm_head_bias ---
-        # 确保传递给 Ops.linear 的 bias 永远是一个有效的 Tensor，而不是 None
-        # Prefer a cached bias tensor if the model did not provide one.
+        # --- 预先准备好 lm_head_bias
         if self.lm_head_bias is not None:
             bias_t = self.lm_head_bias
         else:
             if self._cached_lm_head_bias is None or tuple(int(s) for s in self._cached_lm_head_bias.shape()) != (vocab_size,):
                 target_dtype = self.lm_head_weight.dtype()
                 bt = Tensor(shape=(vocab_size,), dtype=target_dtype, device=self.device)
-                # create zero numpy buffer with matching dtype
+                # create zero numpy buffer
                 if target_dtype == DataType.BF16 and ml_dtypes:
                     np_dtype = ml_dtypes.bfloat16
                 elif target_dtype == DataType.F16:
@@ -439,7 +287,6 @@ class Qwen2:
                     need_alloc = True
                 else:
                     try:
-                        # 兼容 .shape() 方法或 shape 属性
                         if callable(getattr(existing_k, 'shape', None)):
                             existing_cap = int(existing_k.shape()[0])
                         else:
@@ -454,7 +301,6 @@ class Qwen2:
                     v_cache = Tensor(shape=(total_capacity, kv_heads, head_dim), dtype=self.layers[li]['v_w'].dtype(), device=self.device)
                     self.kv_cache[li]['k'] = k_cache
                     self.kv_cache[li]['v'] = v_cache
-                # 注意：这里的 'len' 在本函数开始时已经被安全地重置为 0
             
             for i in range(len(self.layers)):
                 x = self._block_forward(x, i, pos_ids)
@@ -502,7 +348,8 @@ class Qwen2:
                     if logits_dtype == DataType.BF16: logits_np = (u16.astype(_np.uint32) << 16).view(_np.float32)
                     else: logits_np = u16.view(_np.float16).astype(_np.float32)
 
-                if temperature != 1.0 and temperature > 0.0: logits_np /= float(temperature)
+                if temperature != 1.0 and temperature > 0.0: 
+                    logits_np /= float(temperature)
                 
                 logits_np -= _np.max(logits_np)
                 probs = _np.exp(logits_np)
@@ -518,9 +365,7 @@ class Qwen2:
                     sorted_probs = probs[sorted_indices]
                     cumulative_probs = _np.cumsum(sorted_probs)
                     
-                    # --- [ 正确的 Top-P (Nucleus Sampling) 逻辑 ] ---
-                    # 找到要移除的 token 的索引。我们移除所有累积概率超过 top_p 的 token。
-                    # 但为了包含那个“跨过”阈值的 token，我们需要做一个移位操作。
+                    # 找到要移除的 token 的索引
                     sorted_indices_to_remove = cumulative_probs > top_p
                     
                     # 向右移动一位，这样第一个超过阈值的 token 就不会被标记为移除了
@@ -530,7 +375,6 @@ class Qwen2:
                     # 获取原始词表中需要被移除的 token 的索引
                     indices_to_remove = sorted_indices[sorted_indices_to_remove]
                     probs[indices_to_remove] = 0.0
-                    # --- [ 修复结束 ] ---
 
                 final_probs = probs / (_np.sum(probs) + 1e-9)
                 new_token_id = int(_np.random.choice(vocab_size, p=final_probs))
@@ -581,7 +425,7 @@ class Qwen2:
 
     def _block_forward(self, x: Tensor, layer_idx: int, pos_ids: Tensor) -> Tensor:
         """
-        [Ultra-Optimized] In-Place K Update & Zero-Copy V Update.
+        In-Place K Update & Zero-Copy V Update.
         Eliminates 'k_temp' scratch buffer entirely.
         """
         layer = self.layers[layer_idx]
@@ -654,7 +498,7 @@ class Qwen2:
         
         Ops.self_attention(attn_out, q_rope, k_dest, v_dest, scale, past_k, past_v)
 
-        # --- MLP 部分 (保持不变) ---
+        # --- MLP ---
         attn_flat = attn_out.view(seq_len, d_model)
         o = self._get_scratch(layer_idx, "o", (seq_len, d_model), attn_flat.dtype())
         Ops.linear(o, attn_flat, layer.get("o_w"), layer.get("o_b"))
@@ -684,14 +528,6 @@ class Qwen2:
 
     @staticmethod
     def should_sample(do_sample: bool, temperature: float, top_k: int = None, top_p: float = None) -> bool:
-        """
-        综合考虑多个参数判断是否需要采样（供 `generate` 使用）。
-
-        语义说明：
-        - `do_sample` 为调用方显式开启采样时应为 True；
-        - temperature == 0.0 或 top_k == 1 或 top_p == 0.0 会退化为 greedy；
-        - top_p 只有在 (0,1) 时生效。
-        """
         # 1. 若调用方显式关闭采样，直接返回 False
         if not bool(do_sample):
             return False
