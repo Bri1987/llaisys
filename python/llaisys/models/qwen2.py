@@ -344,19 +344,37 @@ class Qwen2:
     # ... (文件顶部的 import 和 __init__ 方法保持不变) ...
 # ... 您可以删除 __init__ 方法中的 self.kv_append_via_kernel = True 这一行，因为它不再需要了 ...
 
+    # In qwen2.py, inside the Qwen2 class
+
     def generate(
         self,
         inputs: Sequence[int],
         max_new_tokens: int = None,
-        **kwargs  # <--- 【核心修改】添加这部分
+        do_sample: bool = False,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 0.0,
+        **kwargs  # 兼容旧的额外参数
     ):
         """
-        [最终版] 使用KV缓存生成序列。
-        此版本修复了 lm_head_bias 的处理和模型维度的健壮性获取。
+        [最终修复版] 使用KV缓存生成序列。
+        此版本在函数入口处增加了对KV Cache状态的强制重置，解决了因状态污染导致的连续调用崩溃问题。
         """
+        # --- [核心修复] ---
+        # 在每次调用 generate 时，必须重置 KV 缓存的已写入长度。
+        # 这确保了即使复用已分配的 Tensor，新的序列也会从头开始写入，
+        # 从而避免了因状态污染导致的底层内存访问错误。
+        for layer_cache in self.kv_cache:
+            layer_cache['len'] = 0
+        # --- 修复结束 ---
+
+        # 提取可能的回调（streaming 使用），其余 kwargs 仍然兼容但不使用
+        token_callback = None
         if kwargs:
-            print(f"[generate info] Ignoring extra arguments: {kwargs}")
-            
+            token_callback = kwargs.pop("token_callback", None)
+            if kwargs:
+                print(f"[generate info] Ignoring extra arguments: {kwargs}")
+
         if max_new_tokens is None:
             max_new_tokens = 1
 
@@ -376,7 +394,7 @@ class Qwen2:
         if self.lm_head_bias is not None:
             bias_t = self.lm_head_bias
         else:
-            if self._cached_lm_head_bias is None:
+            if self._cached_lm_head_bias is None or tuple(int(s) for s in self._cached_lm_head_bias.shape()) != (vocab_size,):
                 target_dtype = self.lm_head_weight.dtype()
                 bt = Tensor(shape=(vocab_size,), dtype=target_dtype, device=self.device)
                 # create zero numpy buffer with matching dtype
@@ -414,20 +432,33 @@ class Qwen2:
             kv_heads = self.config.get("num_key_value_heads") or num_heads
             head_dim = d_model // num_heads
             for li in range(len(self.layers)):
-                # if not already allocated, create k/v cache tensors
-                if self.kv_cache[li].get('k') is None:
+                # 如果还没分配，或已分配但容量不足，则分配/重分配 k/v cache
+                existing_k = self.kv_cache[li].get('k')
+                need_alloc = False
+                if existing_k is None:
+                    need_alloc = True
+                else:
+                    try:
+                        # 兼容 .shape() 方法或 shape 属性
+                        if callable(getattr(existing_k, 'shape', None)):
+                            existing_cap = int(existing_k.shape()[0])
+                        else:
+                            existing_cap = int(existing_k.shape[0])
+                    except Exception:
+                        existing_cap = 0
+                    if existing_cap < total_capacity:
+                        need_alloc = True
+
+                if need_alloc:
                     k_cache = Tensor(shape=(total_capacity, kv_heads, head_dim), dtype=self.layers[li]['k_w'].dtype(), device=self.device)
                     v_cache = Tensor(shape=(total_capacity, kv_heads, head_dim), dtype=self.layers[li]['v_w'].dtype(), device=self.device)
                     self.kv_cache[li]['k'] = k_cache
                     self.kv_cache[li]['v'] = v_cache
-                    self.kv_cache[li]['len'] = 0
-
+                # 注意：这里的 'len' 在本函数开始时已经被安全地重置为 0
+            
             for i in range(len(self.layers)):
                 x = self._block_forward(x, i, pos_ids)
         else: # 处理空 prompt 的情况
-            # 对于空输入，我们需要一个起始的 hidden_state，通常是全零
-            # 为了简单起见，我们假设输入至少有一个 token (e.g., BOS token)
-            # 在实际应用中这里可能需要更复杂的处理
             if max_new_tokens > 0:
                  raise ValueError("Cannot generate from an empty prompt without a specified BOS token.")
             return []
@@ -440,46 +471,94 @@ class Qwen2:
             final_hidden_state = next_token_input
 
             # reuse or lazily allocate logits and argmax output tensors
-            if self._reusable_logits is None:
+            if self._reusable_logits is None or tuple(int(s) for s in self._reusable_logits.shape()) != (1, vocab_size):
                 self._reusable_logits = Tensor(shape=(1, vocab_size), dtype=self.lm_head_weight.dtype(), device=self.device)
-            else:
-                # ensure shape matches (in case vocab_size differs between calls)
-                try:
-                    if tuple(int(s) for s in self._reusable_logits.shape()) != (1, vocab_size):
-                        self._reusable_logits = Tensor(shape=(1, vocab_size), dtype=self.lm_head_weight.dtype(), device=self.device)
-                except Exception:
-                    self._reusable_logits = Tensor(shape=(1, vocab_size), dtype=self.lm_head_weight.dtype(), device=self.device)
 
-            Ops.linear(self._reusable_logits, final_hidden_state, self.lm_head_weight, bias_t) # 现在 bias_t 永远有效
+            Ops.linear(self._reusable_logits, final_hidden_state, self.lm_head_weight, bias_t)
 
-            if self._reusable_argmax_idx is None:
-                self._reusable_argmax_idx = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
-            if self._reusable_argmax_val is None:
-                self._reusable_argmax_val = Tensor(shape=(1,), dtype=DataType.F32, device=self.device)
-
-            Ops.argmax(self._reusable_argmax_idx, self._reusable_argmax_val, self._reusable_logits)
-
-            # Copy the single index value from device -> host with RuntimeAPI (D2H)
-            import ctypes
+            new_token_id = None
+            
             runtime = RuntimeAPI(self.device)
-            host_ptr = runtime.malloc_host(ctypes.sizeof(ctypes.c_int64))
-            # src is the device pointer of the reusable argmax idx tensor
-            src_dev_ptr = ctypes.c_void_p(self._reusable_argmax_idx.data_ptr())
-            runtime.memcpy_sync(host_ptr, src_dev_ptr, ctypes.sizeof(ctypes.c_int64), MemcpyKind.D2H)
-            new_token_id = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_int64)).contents.value
-            runtime.free_host(host_ptr)
+            import ctypes
+
+            if self.should_sample(do_sample, temperature, top_k, top_p):
+                # Copy logits from device -> host and perform sampling in numpy
+                logits_dtype = self._reusable_logits.dtype()
+                if logits_dtype == DataType.F32:
+                    elem_size, HostArrayType = ctypes.sizeof(ctypes.c_float), ctypes.c_float
+                else:
+                    elem_size, HostArrayType = ctypes.sizeof(ctypes.c_uint16), ctypes.c_uint16
+
+                host_ptr = runtime.malloc_host(elem_size * vocab_size)
+                src_dev_ptr = ctypes.c_void_p(self._reusable_logits.data_ptr())
+                runtime.memcpy_sync(host_ptr, src_dev_ptr, elem_size * vocab_size, MemcpyKind.D2H)
+
+                if HostArrayType is ctypes.c_float:
+                    arr = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_float * vocab_size)).contents
+                    logits_np = _np.ctypeslib.as_array(arr).astype(_np.float32)
+                else:
+                    arr = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_uint16 * vocab_size)).contents
+                    u16 = _np.ctypeslib.as_array(arr).astype(_np.uint16)
+                    if logits_dtype == DataType.BF16: logits_np = (u16.astype(_np.uint32) << 16).view(_np.float32)
+                    else: logits_np = u16.view(_np.float16).astype(_np.float32)
+
+                if temperature != 1.0 and temperature > 0.0: logits_np /= float(temperature)
+                
+                logits_np -= _np.max(logits_np)
+                probs = _np.exp(logits_np)
+                probs /= _np.sum(probs)
+
+                if top_k > 1 and top_k < vocab_size:
+                    kth_prob = _np.partition(probs, -top_k)[-top_k]
+                    probs[probs < kth_prob] = 0.0
+                
+                if top_p > 0.0 and top_p < 1.0:
+                    sorted_indices = _np.argsort(probs)[::-1]
+                    # 对排序后的概率计算累积和
+                    sorted_probs = probs[sorted_indices]
+                    cumulative_probs = _np.cumsum(sorted_probs)
+                    
+                    # --- [ 正确的 Top-P (Nucleus Sampling) 逻辑 ] ---
+                    # 找到要移除的 token 的索引。我们移除所有累积概率超过 top_p 的 token。
+                    # 但为了包含那个“跨过”阈值的 token，我们需要做一个移位操作。
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    
+                    # 向右移动一位，这样第一个超过阈值的 token 就不会被标记为移除了
+                    sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1]
+                    sorted_indices_to_remove[0] = False # 确保第一个 token 永远不会因为移位被移除
+                    
+                    # 获取原始词表中需要被移除的 token 的索引
+                    indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                    probs[indices_to_remove] = 0.0
+                    # --- [ 修复结束 ] ---
+
+                final_probs = probs / (_np.sum(probs) + 1e-9)
+                new_token_id = int(_np.random.choice(vocab_size, p=final_probs))
+                runtime.free_host(host_ptr)
+            else:
+                # Greedy path
+                if self._reusable_argmax_idx is None: self._reusable_argmax_idx = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
+                if self._reusable_argmax_val is None: self._reusable_argmax_val = Tensor(shape=(1,), dtype=DataType.F32, device=self.device)
+                Ops.argmax(self._reusable_argmax_idx, self._reusable_argmax_val, self._reusable_logits)
+                
+                host_ptr = runtime.malloc_host(ctypes.sizeof(ctypes.c_int64))
+                src_dev_ptr = ctypes.c_void_p(self._reusable_argmax_idx.data_ptr())
+                runtime.memcpy_sync(host_ptr, src_dev_ptr, ctypes.sizeof(ctypes.c_int64), MemcpyKind.D2H)
+                new_token_id = ctypes.cast(host_ptr, ctypes.POINTER(ctypes.c_int64)).contents.value
+                runtime.free_host(host_ptr)
             
             generated_tokens.append(new_token_id)
+            if token_callback is not None:
+                try: token_callback(int(new_token_id))
+                except Exception: pass
             
             if self.eos_token_id is not None and new_token_id == self.eos_token_id:
-                print(f"[generate info] EOS token ({self.eos_token_id}) generated. Stopping.")
-                break # 提前终止循环
+                break
 
             if step < max_new_tokens - 1:
                 current_pos = prompt_len + step
-                # reuse small numpy buffers and device tensors for single-token steps
-                if step == 0:
-                    # preallocate small host buffers and device tensors for reuse
+                # Lazy-initialize reusable tensors for single-token decoding steps
+                if not hasattr(self, '_decode_pos_tensor'):
                     self._decode_pos_np = _np.zeros((1,), dtype=_np.int64)
                     self._decode_pos_tensor = Tensor(shape=(1,), dtype=DataType.I64, device=self.device)
                     self._decode_token_np = _np.zeros((1,), dtype=_np.int64)
@@ -487,7 +566,6 @@ class Qwen2:
 
                 self._decode_pos_np[0] = current_pos
                 self._decode_pos_tensor.load(c_void_p(self._decode_pos_np.ctypes.data))
-
                 self._decode_token_np[0] = new_token_id
                 self._decode_token_tensor.load(c_void_p(self._decode_token_np.ctypes.data))
 
@@ -603,3 +681,33 @@ class Qwen2:
         Ops.add(new_x, res, down)
 
         return new_x
+
+    @staticmethod
+    def should_sample(do_sample: bool, temperature: float, top_k: int = None, top_p: float = None) -> bool:
+        """
+        综合考虑多个参数判断是否需要采样（供 `generate` 使用）。
+
+        语义说明：
+        - `do_sample` 为调用方显式开启采样时应为 True；
+        - temperature == 0.0 或 top_k == 1 或 top_p == 0.0 会退化为 greedy；
+        - top_p 只有在 (0,1) 时生效。
+        """
+        # 1. 若调用方显式关闭采样，直接返回 False
+        if not bool(do_sample):
+            return False
+
+        # 2. temperature == 0 明确表示贪婪
+        if temperature is not None and float(temperature) == 0.0:
+            return False
+
+        # 3. top_k == 1 等价于 greedy
+        if top_k is not None and int(top_k) == 1:
+            return False
+
+        # 4. top_p == 0.0 也被视为不进行 nucleus 截断（退化为 greedy）
+        if top_p is not None and float(top_p) == 0.0:
+            return False
+
+        # 5. 若 temperature 未设置（None），则尊重 do_sample（上面已检查）
+        # 默认按 do_sample 处理
+        return True
