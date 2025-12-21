@@ -30,13 +30,13 @@ def _kernel(
 
     # --- 2. 指针计算 ---
     # 计算 X 和 W 的基础指针位置
-    # X 形状 [M, K], 我们取 [BLOCK_M, BLOCK_K] 的块
-    # W 形状 [N, K], 我们取 [BLOCK_N, BLOCK_K] 的块
+    # X 形状 [M, K], 取 [BLOCK_M, BLOCK_K] 的块
+    # W 形状 [N, K], 取 [BLOCK_N, BLOCK_K] 的块
     x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
     w_ptrs = W_ptr + (offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk)
 
     # --- 3. 矩阵乘法主循环 ---
-    # 初始化累加器为 fp32 (保证精度)
+    # 初始化累加器为 fp32
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     for k in range(0, tl.cdiv(K, BLOCK_K)):
@@ -62,7 +62,7 @@ def _kernel(
         x_ptrs += BLOCK_K * stride_xk
         w_ptrs += BLOCK_K * stride_wk
 
-    # --- 4. 后处理 (Bias & Store) ---
+    # --- 4. Bias & Store ---
     
     # 加载 Bias (如果存在)
     if Bias_ptr is not None:
@@ -87,3 +87,68 @@ def _kernel(
     out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     
     tl.store(out_ptrs, c, mask=out_mask)
+
+# ----------- 精度正确的版本
+# import triton
+# import triton.language as tl
+
+# @triton.jit
+# def _kernel(
+#     # 指针
+#     X_ptr, W_ptr, Bias_ptr, Out_ptr,
+#     # 形状
+#     M, N, K,
+#     # Strides
+#     stride_xm, stride_xk,
+#     stride_wn, stride_wk,
+#     stride_om, stride_on,
+#     # Block 参数
+#     BLOCK_M: tl.constexpr, 
+#     BLOCK_N: tl.constexpr, 
+#     BLOCK_K: tl.constexpr,
+#     # 精度控制
+#     OUT_FP32: tl.constexpr,
+# ):
+#     pid_m = tl.program_id(0)
+#     pid_n = tl.program_id(1)
+#     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+#     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+#     offs_k = tl.arange(0, BLOCK_K)
+
+#     x_ptrs = X_ptr + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+#     w_ptrs = W_ptr + (offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk)
+
+#     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float64)
+
+#     for k in range(0, tl.cdiv(K, BLOCK_K)):
+#         current_k_len = K - k * BLOCK_K
+#         k_mask = offs_k < current_k_len
+
+#         # 加载 X 和 W，此时它们是原始类型 (例如 float32)
+#         mask_m = offs_m[:, None] < M
+#         x = tl.load(x_ptrs, mask=mask_m & k_mask[None, :], other=0.0)
+
+#         mask_n = offs_n[:, None] < N
+#         w = tl.load(w_ptrs, mask=mask_n & k_mask[None, :], other=0.0)
+
+#         # 转换为 float64
+#         result_dot = tl.dot(x, tl.trans(w), allow_tf32=False)
+#         accumulator += result_dot.to(tl.float64)
+
+#         x_ptrs += BLOCK_K * stride_xk
+#         w_ptrs += BLOCK_K * stride_wk
+
+#     # Bias 的处理逻辑也需要类似地转换为 float64
+#     if Bias_ptr is not None:
+#         bias_ptrs = Bias_ptr + offs_n
+#         bias_mask = offs_n < N
+#         # 加载原始精度的 bias
+#         bias = tl.load(bias_ptrs, mask=bias_mask, other=0.0)
+#         # 转换为 float64 再相加
+#         accumulator += bias[None, :].to(tl.float64)
+
+#     # tl.store 会自动处理从 float64 到目标类型的转换
+#     c = accumulator
+#     out_ptrs = Out_ptr + (stride_om * offs_m[:, None] + stride_on * offs_n[None, :])
+#     out_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+#     tl.store(out_ptrs, c, mask=out_mask)

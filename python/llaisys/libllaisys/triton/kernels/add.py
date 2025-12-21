@@ -1,10 +1,7 @@
 # file: triton/kernels/add.py
 
-try:
-    import triton
-    import triton.language as tl
-except ImportError:
-    triton = None
+import triton
+import triton.language as tl
 
 # JIT 内核 (_kernel)
 # 它现在接收的是 Tensor-like 对象，而不是整数指针
@@ -33,10 +30,9 @@ def _kernel(
     tl.store(C_tensor + offsets, output, mask=mask)
 
 
-# Python 侧的启动器 (kernel)
 def kernel(a, b, c, BLOCK_SIZE: int = 1024):
     """
-    [最终版] Run elementwise add using Triton on wrapper objects.
+    Run elementwise add using Triton on wrapper objects.
 
     Args:
         a, b, c: Objects that mimic a tensor interface for Triton,
@@ -49,7 +45,7 @@ def kernel(a, b, c, BLOCK_SIZE: int = 1024):
     
     grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
 
-    # 【核心】直接将 wrapper 对象传递给 JIT 内核
+    # 直接将 wrapper 对象传递给 JIT 内核
     _kernel[grid](
         a,  # a 是 LLAITensorAdapter 对象
         b,  # b 是 LLAITensorAdapter 对象

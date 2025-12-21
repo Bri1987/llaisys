@@ -199,8 +199,6 @@ def kernel(
     tl.store(o_block_ptr, acc.to(o_ptr.type.element_ty), boundary_check=(0, 1))
 
 
-# --- Decode split/combine kernels (port from hw2 scaled_dot_product_attention_decode)
-# Note: removed @triton.autotune and torch dependency. Expose as plain triton.jit kernels.
 @triton.jit
 def split_kv_kernel(
     q_ptr,
@@ -220,7 +218,7 @@ def split_kv_kernel(
     seq_len_q,
     seq_len_k_v,
     current_seq_len,
-    S,
+    S, 
     EMB_DIM: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
     M_BINNED: tl.constexpr, N_BINNED: tl.constexpr,
@@ -253,7 +251,7 @@ def split_kv_kernel(
 
     log2e: tl.constexpr = 1.4426950408889634
     qk_scale = scale * log2e
-
+    
     # --- 加载 q ---
     q_ptr_base = q_ptr + off_z * q_stride_z + off_h * q_stride_h
     q_block_ptr = tl.make_block_ptr(
@@ -283,24 +281,24 @@ def split_kv_kernel(
             
             k = tl.load(past_k_block_ptr, boundary_check=(1,))
             v = tl.load(past_v_block_ptr, boundary_check=(0,))
-
-            # use elementwise dot for small EMB_DIM to avoid tl.dot size assertions
-            if EMB_DIM <= 16:
-                qk_scores = tl.sum(q[:, None, :] * tl.trans(k)[None, :, :], 2)
-            else:
-                qk_scores = tl.dot(q, k)
+            
+            qk_scores = tl.dot(q, k)
+            
+            # 【修复开始】: 显式 Mask 掉 Past KV 中超出实际长度的填充部分
+            # make_block_ptr 会把越界的部分填 0，导致 exp(0)=1，干扰 Softmax。
+            # 必须将这些位置设为 -inf。
+            cur_n_indices = n_block_start + tl.arange(0, BLOCK_SIZE_N)
+            # 只要索引小于 past_seq_len 就是有效的
+            boundary_mask = cur_n_indices[None, :] < past_seq_len
+            qk_scores = tl.where(boundary_mask, qk_scores, float("-inf"))
+            # 【修复结束】
+            
             # 在线Softmax更新
             new_max_score = tl.maximum(max_log_score, tl.max(qk_scores, 1))
             rescale_factor = tl.math.exp2((max_log_score - new_max_score) * qk_scale)
             softmax_probs = tl.math.exp2(qk_scores * qk_scale - new_max_score[:, None] * qk_scale)
             output_accumulator *= rescale_factor[:, None]
-            # ensure matching dtypes and avoid tl.dot for small shapes
-            p_fp32 = tl.cast(softmax_probs, tl.float32) if getattr(softmax_probs, 'dtype', None) != tl.float32 else softmax_probs
-            v_fp32 = tl.cast(v, tl.float32) if getattr(v, 'dtype', None) != tl.float32 else v
-            if EMB_DIM <= 16 or BLOCK_SIZE_N <= 16:
-                output_accumulator += tl.sum(p_fp32[:, :, None] * v_fp32[None, :, :], 1)
-            else:
-                output_accumulator += tl.dot(p_fp32, v_fp32)
+            output_accumulator += tl.dot(softmax_probs.to(tl.float16), v.to(tl.float16))
             sum_exp_score = sum_exp_score * rescale_factor + tl.sum(softmax_probs, 1)
             max_log_score = new_max_score
 
@@ -327,32 +325,35 @@ def split_kv_kernel(
             k = tl.load(k_block_ptr, boundary_check=(1,))
             v = tl.load(v_block_ptr, boundary_check=(0,))
 
-            if EMB_DIM <= 16:
-                qk_scores = tl.sum(q[:, None, :] * tl.trans(k)[None, :, :], 2)
-            else:
-                qk_scores = tl.dot(q, k)
+            qk_scores = tl.dot(q, k)
             
             if IS_CAUSAL:
                 n_offsets = n_block_start + tl.arange(0, BLOCK_SIZE_N)
                 causal_mask = (m_offsets[:, None] + past_seq_len) >= n_offsets[None, :]
                 qk_scores = tl.where(causal_mask, qk_scores, float("-inf"))
+                # Current KV Loop 通常不需要额外的 boundary_mask，因为 Causal Mask 
+                # (m + past >= n) 在 n > total_seq 时会自动 Mask 掉越界部分
+                # (前提是 total_seq 也就是 current token 是序列的最后一个)
 
             new_max_score = tl.maximum(max_log_score, tl.max(qk_scores, 1))
             rescale_factor = tl.math.exp2((max_log_score - new_max_score) * qk_scale)
             softmax_probs = tl.math.exp2(qk_scores * qk_scale - new_max_score[:, None] * qk_scale)
             output_accumulator *= rescale_factor[:, None]
-            p_fp32 = tl.cast(softmax_probs, tl.float32) if getattr(softmax_probs, 'dtype', None) != tl.float32 else softmax_probs
-            v_fp32 = tl.cast(v, tl.float32) if getattr(v, 'dtype', None) != tl.float32 else v
-            if EMB_DIM <= 16 or BLOCK_SIZE_N <= 16:
-                output_accumulator += tl.sum(p_fp32[:, :, None] * v_fp32[None, :, :], 1)
-            else:
-                output_accumulator += tl.dot(p_fp32, v_fp32)
+            output_accumulator += tl.dot(softmax_probs.to(tl.float16), v.to(tl.float16))
             sum_exp_score = sum_exp_score * rescale_factor + tl.sum(softmax_probs, 1)
             max_log_score = new_max_score
 
-    inverse_l_i = 1.0 / sum_exp_score
-    final_output = output_accumulator * inverse_l_i[:, None]
     final_logsumexp = max_log_score * scale + tl.log(sum_exp_score)
+
+    # 修复 S>1 时的 NaN 问题：
+    # 当 sum_exp_score 为 0 时 (此 Split 为空)，inverse_l_i 为 Inf。
+    # 0.0 * Inf = NaN。我们需要强制让它为 0.0。
+    final_output = tl.where(
+        sum_exp_score[:, None] > 0.0, 
+        output_accumulator * (1.0 / sum_exp_score[:, None]), 
+        0.0
+    )
+    # -------------------------------------------------------------------------
     
     if IS_CAUSAL and seq_len_q > seq_len_k_v:
         empty_row_mask = (m_offsets + past_seq_len) < 0
@@ -363,7 +364,6 @@ def split_kv_kernel(
                   
     tl.store(final_l_ptr, final_logsumexp, mask=row_mask)
     tl.store(final_o_ptr, final_output.to(tl.float16), mask=row_mask[:, None])
-
 
 @triton.jit
 def combine_kv_splits_kernel(
@@ -377,14 +377,17 @@ def combine_kv_splits_kernel(
     BLOCK_SIZE_M: tl.constexpr,
     M_BINNED: tl.constexpr,
 ):
+    # --- 1. 获取程序ID ---
     m_block_idx = tl.program_id(0)
     h_idx = tl.program_id(1)
     z_idx = tl.program_id(2)
 
+    # --- 2. 准备基础指针和偏移量 ---
     m_offsets = m_block_idx * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     k_offsets = tl.arange(0, EMB_DIM)
     row_mask = m_offsets < seq_len_q
 
+    #  预先计算当前 (Batch, Head) slice 的基地址
     base_split_l_ptr = split_logsumexp + (z_idx * num_heads + h_idx) * S * seq_len_q
     base_split_o_ptr = split_outputs + z_idx * stride_split_oz + h_idx * stride_split_oh
     
@@ -393,11 +396,14 @@ def combine_kv_splits_kernel(
     final_o_ptr = base_final_o_ptr + m_offsets[:, None] * stride_fin_om + k_offsets[None, :] * stride_fin_ok
     final_l_ptr = base_final_l_ptr + m_offsets
 
+    # --- 3. 初始化累加器 ---
     acc_o = tl.zeros([BLOCK_SIZE_M, EMB_DIM], dtype=tl.float32)
     acc_l = tl.zeros([BLOCK_SIZE_M], dtype=tl.float32)
     m_i = tl.full([BLOCK_SIZE_M], value=-float("inf"), dtype=tl.float32)
 
+    # --- 4. 遍历所有 split，在线更新 acc_o 和 acc_l ---
     for s_idx in range(S):
+        # 加载当前 split 的 l_j 和 o_j
         current_l_ptr = base_split_l_ptr + s_idx * seq_len_q + m_offsets
         current_o_ptr = base_split_o_ptr + s_idx * stride_split_os + \
                         m_offsets[:, None] * stride_split_om + k_offsets[None, :]
@@ -405,6 +411,7 @@ def combine_kv_splits_kernel(
         l_j = tl.load(current_l_ptr, mask=row_mask, other=-float('inf'))
         o_j = tl.load(current_o_ptr, mask=row_mask[:, None])
 
+        # --- 在线 softmax ---
         m_new = tl.maximum(m_i, l_j)
         P_j_scaled = tl.exp(l_j - m_new)
         rescale_factor = tl.exp(m_i - m_new)
@@ -412,9 +419,9 @@ def combine_kv_splits_kernel(
         acc_l = acc_l * rescale_factor + P_j_scaled
         m_i = m_new
 
+    # --- 5. 计算最终的 l 和 o ---
     final_l_val = m_i + tl.log(acc_l)
     final_o_val = acc_o / acc_l[:, None]
     
     tl.store(final_o_ptr, final_o_val.to(final_o.type.element_ty), mask=row_mask[:, None])
     tl.store(final_l_ptr, final_l_val, mask=row_mask)
- 

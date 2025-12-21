@@ -4,8 +4,7 @@ import triton.language as tl
 @triton.jit
 def _argmax_combine(val1, idx1, val2, idx2):
     """
-    自定义归约逻辑：
-    返回较大的值；如果值相等，返回索引较小的那个（保持稳定性）。
+    返回较大的值；如果值相等，返回索引较小的那个。
     """
     gt = val1 > val2
     # 如果 val1 > val2，选 val1，否则选 val2
@@ -61,14 +60,13 @@ def _kernel_stage2(
 ):
     """
     Stage 2: 读取 Stage 1 的所有输出，归约为最终结果。
-    注意：这里假设 partial 数量 <= BLOCK_SIZE (通常 < 1024)。
+    假设 partial 数量 <= BLOCK_SIZE
     """
     # Stage 2 通常只有一个 Block (grid=[1])
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_partials
 
-    # 1. 加载所有 Partial 结果
-    # 注意：Stage 2 不仅加载值，还要加载 Stage 1 算出的全局索引
+    # 1. 加载所有 Partial 结果, 不仅加载值，还要加载 Stage 1 算出的全局索引
     vals = tl.load(partial_vals_ptr + offsets, mask=mask, other=float("-inf"))
     idxs = tl.load(partial_idx_ptr + offsets, mask=mask, other=0) # other无所谓，因为val是-inf
 
@@ -104,15 +102,14 @@ def kernel_stage2(partial_vals, partial_idx, max_val, max_idx, m_blocks, BLOCK_S
     # 找到最近的 2 的幂次以适应 Triton
     input_size = m_blocks
     # 简单的 heuristic: 确保 BLOCK_SIZE 足够大
-    # 如果 input_size 很小，用小一点的 block 也可以，但最大不超过显卡限制 (通常 1024)
-    # 为了简单，我们这里复用传入的 BLOCK_SIZE，但在调用处应确保 BLOCK_SIZE >= m_blocks
+    # 为了简单，这里复用传入的 BLOCK_SIZE，但在调用处应确保 BLOCK_SIZE >= m_blocks
     
-    # 如果传入的 BLOCK_SIZE 小于 m_blocks，强制增大 (虽然通常外部调用逻辑会控制)
+    # 如果传入的 BLOCK_SIZE 小于 m_blocks，强制增大
     curr_block = 128
     while curr_block < input_size:
         curr_block *= 2
     
-    # Grid 为 1，因为我们要做全局归约
+    # Grid 为 1，因为全局归约
     _kernel_stage2[(1,)](
         partial_vals, 
         partial_idx, 
