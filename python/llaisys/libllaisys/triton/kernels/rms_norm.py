@@ -1,11 +1,7 @@
-# file: triton/kernels/rms_norm.py
 
-try:
-    import triton
-    import triton.language as tl
-except ImportError:
-    triton = None
-    tl = None
+import triton
+import triton.language as tl
+
 
 @triton.jit
 def _kernel(
@@ -23,7 +19,6 @@ def _kernel(
 
     # --- 第一阶段: 计算均方根 (Sum of Squares) ---
     
-    # 初始化累加器为 float32 或 float64 以保证精度
     # 对于 RMSNorm，float32 通常足够了
     acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
     
@@ -79,7 +74,7 @@ def _kernel(
 
 def kernel(inp, weight, out, M, D, eps: float = 1e-5, BLOCK_SIZE: int = 1024):
     """
-    [原创无 Torch 版] 接收 Wrapper 对象的 RMSNorm 启动器。
+    Launcher for Triton-backed RMSNorm.
     """
     if triton is None:
         raise RuntimeError("Triton not found.")

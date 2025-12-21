@@ -14,18 +14,15 @@ def _rope_kernel(x_ptr, out_ptr, sin_ptr, cos_ptr, seq_len, n_heads, head_dim, H
     row = tl.program_id(0)
     col_block = tl.program_id(1)
 
-    # compute seq and head from row
     seq = row // n_heads
     head = row % n_heads
 
-    # base offset for this (seq, head)
     base = (seq * n_heads + head) * head_dim
 
     col_start = col_block * BLOCK
     cols = col_start + tl.arange(0, BLOCK)
     mask = cols < HALF
 
-    # load a and b for cols
     a_idx = base + cols
     b_idx = base + cols + HALF
 
@@ -40,7 +37,6 @@ def _rope_kernel(x_ptr, out_ptr, sin_ptr, cos_ptr, seq_len, n_heads, head_dim, H
     y_a = a * cos_v - b * sin_v
     y_b = b * cos_v + a * sin_v
 
-    # store results
     tl.store(out_ptr + a_idx, y_a, mask=mask)
     tl.store(out_ptr + b_idx, y_b, mask=mask)
 
@@ -53,7 +49,6 @@ def kernel(x, out, sin, cos, BLOCK=128):
     """
     seq_len = x.shape[0]
     total_elems = x.numel()
-    # infer HALF from sin length divided by seq_len
     HALF = sin.shape[0] // seq_len
     head_dim = HALF * 2
     n_heads = total_elems // (seq_len * head_dim)

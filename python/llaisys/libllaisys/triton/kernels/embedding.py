@@ -1,9 +1,5 @@
-try:
-    import triton
-    import triton.language as tl
-except ImportError:
-    triton = None
-    tl = None
+import triton
+import triton.language as tl
 
 @triton.jit
 def _kernel(
@@ -15,7 +11,7 @@ def _kernel(
     BLOCK_SIZE: tl.constexpr
 ):
     """
-    [优化版] 2D Tiling Embedding Kernel
+    2D Tiling Embedding Kernel
     
     Grid 布局:
       program_id(0): 处理 Embedding 维度方向的分块 (cols)
@@ -29,7 +25,7 @@ def _kernel(
     col_offsets = pid_col * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     
     # 3. 加载 Token ID
-    # 关键优化：每个 Block 只需要加载一次 Scalar 索引，而不是每个元素加载一次
+    # 每个 Block 只需要加载一次 Scalar 索引，而不是每个元素加载一次
     # Index_ptr 指向 [N]，直接加上 row 偏移
     idx_ptr = Index_ptr + pid_row
     token_id = tl.load(idx_ptr)
@@ -45,16 +41,11 @@ def _kernel(
     # 5. 边界检查掩码 (处理 D 不是 BLOCK_SIZE 倍数的情况)
     mask = col_offsets < D
     
-    # 6. 向量化加载和存储
-    # 关键优化：Triton 会自动将其编译为向量指令 (如 ld.global.v4.f32)
     val = tl.load(w_ptr, mask=mask, other=0.0)
     tl.store(o_ptr, val, mask=mask)
 
 
 def kernel(index, weight, out, N, D, BLOCK_SIZE: int = None):
-    """
-    [优化版] Embedding 启动器
-    """
     if triton is None:
         raise RuntimeError("Triton not found.")
 
@@ -72,14 +63,14 @@ def kernel(index, weight, out, N, D, BLOCK_SIZE: int = None):
             # 向上取整到最近的 2 的幂
             BLOCK_SIZE = triton.next_power_of_2(D)
 
-    # Grid 维度计算
+    # Grid
     # X 轴: 覆盖 Embedding 维度 D (所需 block 数量)
     # Y 轴: 覆盖 Batch * SeqLen 维度 N
     grid = (triton.cdiv(D, BLOCK_SIZE), N)
 
     # 启动 Kernel
     _kernel[grid](
-        index,       # LLAITensorAdapter (Triton 会调用 .data_ptr())
+        index,       # LLAITensorAdapter
         weight,      # LLAITensorAdapter
         out,         # LLAITensorAdapter
         D,

@@ -17,12 +17,7 @@ import math
 import os
 from llaisys.runtime import RuntimeAPI
 from llaisys.libllaisys import DeviceType, MemcpyKind, DataType, LIB_LLAISYS
-# scaled_dot_product_attention_decode may not exist in all kernel sets; import safely
-try:
-    from .kernels import scaled_dot_product_attention_decode as decode_kernels
-except Exception:
-    # fallback to self_attention kernel module which exposes the same split/combine kernels
-    decode_kernels = self_attention_kernel
+
 import triton
 import triton.language as tl
 from llaisys.tensor import Tensor
@@ -40,8 +35,6 @@ def get_element_size(llaisys_dtype):
     return dtype_map.get(llaisys_dtype, 4) # 默认为 4 字节 (float32)
 
 
-# Lightweight cache for RoPE precomputed buffers per (device_type, device_id, seq_len, half)
-# Stores dict with keys: 'sin', 'cos' (device Tensors), 'host_stage_bytes' (int), 'host_stage_ptr' (ctypes pointer)
 _rope_cache = {}
 
 class LLAITensorAdapter:
@@ -251,7 +244,7 @@ def kv_cache_write_slice(cache: Tensor, src: Tensor, dst_offset: int):
     
 def llaisysAdd(out, a, b):
     """
-    [无 Torch 版] Launcher that bridges LLAISYS tensors to the Triton add kernel.
+    Launcher that bridges LLAISYS tensors to the Triton add kernel.
     """
     # 1. 将 llaisys.Tensor 包装成 Triton 兼容的对象
     a_wrapped = LLAITensorAdapter(a)
@@ -267,14 +260,9 @@ def llaisysAdd(out, a, b):
 
 def llaisysArgmax(max_idx_out, max_val_out, vals):
     """
-    [高性能优化版] Argmax Launcher
-    优化点:
-    1. Zero-Copy: 移除所有 Host <-> Device 数据拷贝。
-    2. Native Dtype: 直接处理 F16/BF16 输入，无需 Host 端转换。
-    3. Direct Write: Kernel 直接写入输出 Tensor，无需 CPU 中转。
+    Argmax Launcher
     """
     # 1. 包装输入输出
-    # LLAITensorAdapter 会通过 .dtype 属性告诉 Triton 指针的类型
     vals_wr = LLAITensorAdapter(vals)
     idx_out_wr = LLAITensorAdapter(max_idx_out)
     val_out_wr = LLAITensorAdapter(max_val_out)
@@ -288,7 +276,7 @@ def llaisysArgmax(max_idx_out, max_val_out, vals):
     num_blocks = (N + BLOCK_SIZE - 1) // BLOCK_SIZE
 
     # 3. 分配中间 Buffer (纯 Device 端分配)
-    # 我们需要保存 Stage 1 产生的 num_blocks 个局部最大值和索引
+    # 需要保存 Stage 1 产生的 num_blocks 个局部最大值和索引
     # 使用 DataType.F32 存储中间值以保持精度
     # 使用 DataType.I32 存储中间索引 (假设 N < 21亿)
     
@@ -316,7 +304,6 @@ def llaisysArgmax(max_idx_out, max_val_out, vals):
 
     # 5. 执行 Stage 2
     # 输入: partial_vals -> 输出: max_val_out, max_idx_out
-    # 直接将用户提供的输出 Tensor 传给 Kernel，让 Kernel 直接写入结果
     # 刚才优化的 kernel_stage2 会处理 num_blocks 个输入
     argmax_kernel.kernel_stage2(
         p_vals_wr, 
@@ -326,26 +313,24 @@ def llaisysArgmax(max_idx_out, max_val_out, vals):
         num_blocks
     )
 
-    # 返回结果 (虽然已经写入 tensor 了，为了保持接口一致性返回一下)
+    # 虽然已经写入 tensor 了，为了保持接口一致性返回一下
     return max_idx_out, max_val_out
 
 
 def llaisysEmbedding(out, index, weight):
     """
-    [原创无 Torch 版] Launcher for Triton-backed embedding.
+    Launcher for Triton-backed embedding.
     """
-    # 1. 将 llaisys.Tensor 包装成 Triton 兼容的对象
+    # 将 llaisys.Tensor 包装
     index_wrapped = LLAITensorAdapter(index)
     weight_wrapped = LLAITensorAdapter(weight)
     out_wrapped = LLAITensorAdapter(out)
 
-    # 2. 从 wrapper 中获取维度信息
     # N 是 index 的元素数量
     N = index_wrapped.numel() 
     # D 是 embedding 的维度
     D = weight_wrapped.shape[1]
 
-    # 3. 直接将 Wrapper 对象传递给 Triton 内核的启动器
     embedding_kernel.kernel(
         index_wrapped, 
         weight_wrapped, 
@@ -360,7 +345,7 @@ def llaisysEmbedding(out, index, weight):
 
 def llaisysLinear(out, inp, weight, bias):
     """
-    [正确性优先版] Triton Linear Launcher
+    Triton Linear Launcher
     """
     # 1. 包装输入
     x_wr = LLAITensorAdapter(inp)
@@ -379,11 +364,10 @@ def llaisysLinear(out, inp, weight, bias):
     if bias is not None:
         b_wr = LLAITensorAdapter(bias)
 
-    # 4. 获取 Strides (关键修复：兼容 3D 输出 Tensor)
+    # 4. 获取 Strides
     stride_xm, stride_xk = x_wr.strides
     stride_wn, stride_wk = w_wr.strides
     
-    # [FIX] 不要直接解包 out_wr.strides，因为它可能是 3D 的 (Seq, Heads, HeadDim)
     s_out = out_wr.strides
     if len(s_out) == 2:
         stride_om, stride_on = s_out
@@ -429,9 +413,9 @@ def llaisysLinear(out, inp, weight, bias):
 
 def llaisysRmsNorm(out, inp, weight, eps: float):
     """
-    [原创无 Torch 版] Launcher for Triton-backed RMSNorm.
+    Launcher for Triton-backed RMSNorm.
     """
-    # 1. 将 llaisys.Tensor 包装成 Triton 兼容的对象
+    # 将 llaisys.Tensor 包装
     inp_wrapped = LLAITensorAdapter(inp)
     weight_wrapped = LLAITensorAdapter(weight)
     out_wrapped = LLAITensorAdapter(out)
@@ -463,10 +447,6 @@ def llaisysRmsNorm(out, inp, weight, eps: float):
 
 
 def llaisysSelfAttention(attn_val_out, q, k, v, scale: float, past_k=None, past_v=None):
-    """
-    [FINAL DEBUG VERSION] Implements the S=1 fast path for debugging.
-    If S=1, it skips the combine kernel and directly copies the result from the split kernel.
-    """
     q_wr = LLAITensorAdapter(q)
     k_wr = LLAITensorAdapter(k)
     v_wr = LLAITensorAdapter(v)
@@ -551,19 +531,8 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float, past_k=None, past_
 
             # --- S=1 Optimization: Zero-Copy Fast Path ---
             if S == 1:
-                # 即使 S=1，Kernel 仍然会写入 logsumexp，所以我们需要一个临时的 tensor
                 # 但我们可以直接写入 attn_val_out，无需 split_outputs 和 combine 过程
                 split_logsumexp = Tensor(shape=(batch_size, num_heads, 1, seq_len_q), dtype=DataType.F32, device=DeviceType.NVIDIA, device_id=device_id)
-                
-                # 分析 attn_val_out 的布局以构造 Strides
-                # attn_val_out 通常是 [Seq, Head, Dim] (3D) 或 [Batch, Seq, Head, Dim] (4D)
-                # Kernel 期望的是 [Batch, Head, Split, Seq, Dim]
-                # 我们需要映射: 
-                #   Kernel Z -> Out Batch (或 0)
-                #   Kernel H -> Out Head
-                #   Kernel S -> 0 (忽略)
-                #   Kernel M -> Out Seq
-                #   Kernel K -> Out Dim
                 
                 s_out = out_wr.strides
                 if len(s_out) == 3: # [Seq, Head, Dim]
@@ -589,7 +558,7 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float, past_k=None, past_
                     return (triton.cdiv(seq_len_q, meta['BLOCK_SIZE_M']), 1, num_heads * batch_size)
 
                 # 直接把 attn_val_out 作为输出传进去
-                decode_kernels.split_kv_kernel[grid_fast](
+                self_attention_kernel.split_kv_kernel[grid_fast](
                     q_wr, k_wr, v_wr, past_k_wr, past_v_wr,
                     scale_val,
                     LLAITensorAdapter(split_logsumexp.lib_tensor()), out_wr, # <--- 直接写 Out
@@ -627,7 +596,7 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float, past_k=None, past_
                 def grid1(meta):
                     return (triton.cdiv(seq_len_q, meta['BLOCK_SIZE_M']), S, num_heads * batch_size)
 
-                decode_kernels.split_kv_kernel[grid1](
+                self_attention_kernel.split_kv_kernel[grid1](
                     q_wr, k_wr, v_wr, past_k_wr, past_v_wr,
                     scale_val,
                     LLAITensorAdapter(split_logsumexp.lib_tensor()), split_out_wr,
@@ -653,7 +622,7 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float, past_k=None, past_
                 def grid2(meta):
                     return (triton.cdiv(seq_len_q, meta['BLOCK_SIZE_M']), num_heads, batch_size)
 
-                decode_kernels.combine_kv_splits_kernel[grid2](
+                self_attention_kernel.combine_kv_splits_kernel[grid2](
                     LLAITensorAdapter(split_outputs.lib_tensor()), LLAITensorAdapter(split_logsumexp.lib_tensor()),
                     final_o_wr, LLAITensorAdapter(final_l.lib_tensor()),
                     num_heads,
@@ -684,15 +653,11 @@ def llaisysSelfAttention(attn_val_out, q, k, v, scale: float, past_k=None, past_
     return attn_val_out
 
 def llaisysSwiGLU(out, gate, up):
-    """
-    [原创无 Torch 版] Launcher for Triton-backed SwiGLU.
-    """
-    # 1. 将 llaisys.Tensor 包装成 Triton 兼容的对象
+    # 1. 将 llaisys.Tensor 包装
     gate_wrapped = LLAITensorAdapter(gate)
     up_wrapped = LLAITensorAdapter(up)
     out_wrapped = LLAITensorAdapter(out)
 
-    # 2. 直接将 Wrapper 对象传递给 Triton 内核的启动器
     swiglu_kernel.kernel(
         gate_wrapped, 
         up_wrapped, 
@@ -863,9 +828,6 @@ def llaisysROPE(out, inp, pos_ids, theta: float):
         cos_wr,
         BLOCK=128,
     )
-
-    # Note: host_pos_buf and host staging buffers are cached in _rope_cache
-    # and intentionally not freed here to avoid repeated malloc/free.
 
     return out
 
